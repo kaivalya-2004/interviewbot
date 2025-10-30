@@ -397,7 +397,7 @@ class MeetInterviewOrchestrator:
         session_id: str,
         turn_count: int,
         candidate_id: str,
-        duration: int = 30,
+        duration: int = 60,
         is_follow_up_response: bool = False
     ) -> Tuple[Optional[threading.Thread], Optional[datetime]]:
         """

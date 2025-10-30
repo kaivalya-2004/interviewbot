@@ -40,7 +40,7 @@ class MeetSessionManager:
         code = ''.join(random.choices(string.ascii_lowercase, k=3)) + '-' + ''.join(random.choices(string.ascii_lowercase, k=4)) + '-' + ''.join(random.choices(string.ascii_lowercase, k=3))
         return f"https://meet.google.com/{code}"
 
-    def start_bot_session( self, session_id: str, meet_link: str, candidate_id: str, audio_device: Optional[int] = None, enable_video: bool = True, headless: bool = False, video_capture_method: str = "javascript" ) -> bool:
+    def start_bot_session( self, session_id: str, meet_link: str, candidate_id: str, audio_device: Optional[int] = None, enable_video: bool = True, headless: bool = True, video_capture_method: str = "javascript" ) -> bool:
         try:
             logger.info(f"🤖 Starting bot session: {session_id} | Headless: {headless}")
             logger.info(f"📹 Video: {'Enabled' if enable_video else 'Disabled'} | Method: {video_capture_method}")

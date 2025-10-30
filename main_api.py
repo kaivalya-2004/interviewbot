@@ -10,10 +10,11 @@ from pathlib import Path
 
 # --- Import Services ---
 from app.services.interview_service import InterviewService
-from app.services.behavioral_analyzer import BehavioralAnalyzer
+# --- REMOVED BehavioralAnalyzer ---
 from app.services.transcript_parser import TranscriptParser
 from app.services.transcript_analyzer import TranscriptAnalyzer
-from app.services.combined_analyzer import combine_analyses
+# --- MODIFIED: Import new CombinedAnalyzer class ---
+from app.services.combined_analyzer import CombinedAnalyzer 
 from app.core.services.database_service import DBHandler
 from app.services.meet_session_manager import MeetSessionManager
 from app.services.meet_interview_orchestrator import MeetInterviewOrchestrator
@@ -29,23 +30,26 @@ logger = logging.getLogger(__name__)
 app = FastAPI( title="AI Interviewer API", description="Conducts interviews and provides combined analysis." )
 
 # --- Service Initialization ---
-# (Keep initialization try-except block as before)
 db_handler: Optional[DBHandler] = None
 interview_service: Optional[InterviewService] = None
-behavioral_analyzer: Optional[BehavioralAnalyzer] = None
+# --- REMOVED behavioral_analyzer ---
 transcript_parser: Optional[TranscriptParser] = None
 transcript_analyzer: Optional[TranscriptAnalyzer] = None
 meet_session_mgr: Optional[MeetSessionManager] = None
 meet_orchestrator: Optional[MeetInterviewOrchestrator] = None
+# --- ADDED combined_analyzer ---
+combined_analyzer: Optional[CombinedAnalyzer] = None 
 
 try:
     db_handler = DBHandler()
     interview_service = InterviewService()
-    behavioral_analyzer = BehavioralAnalyzer()
+    # --- REMOVED behavioral_analyzer = BehavioralAnalyzer() ---
     transcript_parser = TranscriptParser()
     transcript_analyzer = TranscriptAnalyzer()
     meet_session_mgr = MeetSessionManager(db_handler)
     meet_orchestrator = MeetInterviewOrchestrator( meet_session_mgr, interview_service )
+    # --- ADDED combined_analyzer init ---
+    combined_analyzer = CombinedAnalyzer() 
     logger.info("✅ All services initialized successfully.")
 except Exception as e:
     logger.critical(f"❌ CRITICAL: Failed to initialize services: {e}", exc_info=True)
@@ -71,16 +75,17 @@ def start_and_conduct_interview_task(
     """ Background task for the full interview and analysis pipeline. """
     logger.info(f"[Task: {session_id}] Background task started")
     interview_result = None; transcript_analysis_result = None; behavioral_analysis_result = None; final_report_path = None
-    snapshot_count = 0 # Initialize snapshot count
+    snapshot_count = 0 
 
     try:
         # --- Service Check ---
-        if not all([meet_session_mgr, meet_orchestrator, interview_service, behavioral_analyzer, transcript_analyzer, transcript_parser]):
+        # --- MODIFIED: Check for combined_analyzer, remove behavioral_analyzer ---
+        if not all([meet_session_mgr, meet_orchestrator, interview_service, combined_analyzer, transcript_analyzer, transcript_parser]):
             logger.error(f"[Task: {session_id}] Essential services missing. Aborting."); return
 
         # --- 1. Start Bot & Join Meet ---
         logger.info(f"[Task: {session_id}] Starting bot...")
-        success = meet_session_mgr.start_bot_session( session_id, meet_link, candidate_id, audio_device, enable_video, True, video_capture_method )
+        success = meet_session_mgr.start_bot_session( session_id, meet_link, candidate_id, audio_device, enable_video, False, video_capture_method )
         if not success: logger.error(f"[Task: {session_id}] Bot failed to join Meet."); return
         logger.info(f"[Task: {session_id}] ✅ Bot joined Meet.")
 
@@ -100,24 +105,21 @@ def start_and_conduct_interview_task(
         logger.info(f"[Task: {session_id}] Interview finished: {interview_result.get('status', 'unknown')}")
 
         # --- 5. Get Final Snapshot Count BEFORE Ending Session ---
-        # Get the count while the session might still be technically active to retrieve stats
         snapshot_count = meet_session_mgr.get_snapshot_count(session_id)
-        capture_stats = meet_session_mgr.get_capture_stats(session_id) # Attempt to get stats too
+        capture_stats = meet_session_mgr.get_capture_stats(session_id) 
         logger.info(f"[Task: {session_id}] Final snapshot count (before session end): {snapshot_count}")
 
 
         # --- MODIFICATION: End Meet Session (Leave Call & Cleanup Browser) BEFORE Analysis ---
         logger.info(f"[Task: {session_id}] Ending Google Meet session...")
         try:
-            if meet_session_mgr: meet_session_mgr.end_session(session_id) # This stops video capture, leaves call, cleans up driver
+            if meet_session_mgr: meet_session_mgr.end_session(session_id) 
             logger.info(f"[Task: {session_id}] ✅ Google Meet session ended.")
         except Exception as end_e:
             logger.error(f"[Task: {session_id}] Error during explicit meet session end: {end_e}", exc_info=True)
-            # Continue to analysis anyway
         # --- END MODIFICATION ---
 
         # --- 6. Generate & Read Transcript ---
-        # Transcript generation should have happened in conduct_interview
         transcript_path = Path("data") / candidate_id / "transcripts" / f"transcript_{session_id}.txt"
         transcript_content = None
         if transcript_path.exists():
@@ -131,7 +133,8 @@ def start_and_conduct_interview_task(
         # Behavioral Analysis Thread (uses snapshot_count determined before session end)
         if enable_video and snapshot_count > 0:
             logger.info(f"[Task: {session_id}] Preparing behavioral analysis thread ({snapshot_count} snapshots)...")
-            b_thread = threading.Thread( target=run_analysis_in_thread, args=(behavioral_analyzer.analyze_interview_snapshots, (candidate_id, session_id), analysis_results, "behavioral"), daemon=True )
+            # --- MODIFIED: Call combined_analyzer.perform_behavioral_analysis ---
+            b_thread = threading.Thread( target=run_analysis_in_thread, args=(combined_analyzer.perform_behavioral_analysis, (candidate_id, session_id), analysis_results, "behavioral"), daemon=True )
             analysis_threads.append(b_thread)
         elif enable_video: logger.warning(f"[Task: {session_id}] No snapshots for behavioral analysis.")
 
@@ -163,10 +166,12 @@ def start_and_conduct_interview_task(
         if behavioral_analysis_result or transcript_analysis_result:
             logger.info(f"[Task: {session_id}] Combining analysis results...")
             try:
-                combined_report: CombinedAnalysisReport = combine_analyses(
+                # --- MODIFIED: Call combined_analyzer.combine_analyses ---
+                combined_report: CombinedAnalysisReport = combined_analyzer.combine_analyses(
                     behavioral_result=behavioral_analysis_result,
                     transcript_result=transcript_analysis_result if isinstance(transcript_analysis_result, OverallAnalysis) else None,
                     session_id=session_id, candidate_id=candidate_id )
+                
                 report_dir = Path("data") / candidate_id / session_id / "final_report"; report_dir.mkdir(parents=True, exist_ok=True)
                 final_report_path = report_dir / f"combined_analysis_{session_id}.json"
                 with open(final_report_path, "w", encoding="utf-8") as f: f.write(combined_report.model_dump_json(indent=4))
@@ -178,23 +183,21 @@ def start_and_conduct_interview_task(
     finally:
         # --- 9. Final Cleanup (Mainly Interview Service state now) ---
         logger.info(f"[Task: {session_id}] Final cleanup...")
-        # Meet session should already be ended unless an error occurred before step 5
-        # Call end_session again just in case, it handles already ended sessions
         try:
             if meet_session_mgr: meet_session_mgr.end_session(session_id)
         except Exception as cleanup_e: logger.error(f"Error during final Meet cleanup check: {cleanup_e}")
-        try: # Clear Gemini chat state
+        try: 
             if interview_service: interview_service.end_interview_session(session_id)
         except Exception as cleanup_e: logger.error(f"Error during final Interview state cleanup: {cleanup_e}")
 
         logger.info(f"[Task: {session_id}] ✅ Task finished.")
-        # Optionally update DB status here to 'completed' or 'failed'
 
 
 # --- API Endpoints ---
 @app.on_event("startup")
 async def startup_event():
-    if not all([db_handler, interview_service, behavioral_analyzer, transcript_parser, transcript_analyzer, meet_session_mgr, meet_orchestrator]):
+    # --- MODIFIED: Check for combined_analyzer ---
+    if not all([db_handler, interview_service, combined_analyzer, transcript_parser, transcript_analyzer, meet_session_mgr, meet_orchestrator]):
         logger.critical("❌ One or more essential services failed to initialize.")
 
 @app.get("/")
@@ -212,7 +215,8 @@ async def start_google_meet_interview(
     resume: UploadFile = File(...)
 ):
     """ Starts a new interview session. Questionnaire is optional. """
-    if not all([db_handler, interview_service, meet_session_mgr, meet_orchestrator]):
+    # --- MODIFIED: Check for combined_analyzer ---
+    if not all([db_handler, interview_service, meet_session_mgr, meet_orchestrator, combined_analyzer]):
         raise HTTPException(status_code=503, detail="Services not initialized.")
 
     if video_capture_method not in ["javascript", "screenshot"]:
@@ -252,7 +256,7 @@ async def start_google_meet_interview(
         start_and_conduct_interview_task,
         session_id=session_id, candidate_id=candidate_id, meet_link=meet_link,
         audio_device=audio_device, enable_video=enable_video, video_capture_method=video_capture_method,
-        resume_content=resume_content # Pass resume content
+        resume_content=resume_content 
     )
 
     # 5. Return response
@@ -263,7 +267,7 @@ async def start_google_meet_interview(
 async def get_interview_status(session_id: str) -> Dict[str, Any]:
     if db_handler is None or meet_session_mgr is None: raise HTTPException(status_code=503, detail="Services offline.")
     session_data = db_handler.get_session(session_id)
-    if not session_data: raise HTTPException(status_code=404, detail="Session not found.")
+    if not session_data: raise HTTPException(status_code=44, detail="Session not found.")
     active_session = meet_session_mgr.get_session(session_id)
     bot_status = "ended_or_unknown"; video_enabled = False; video_capture_method = "unknown"; snapshot_count = 0; capture_stats = None
     if active_session:
@@ -302,7 +306,16 @@ async def get_snapshot_info(session_id: str):
 
 @app.get("/health")
 async def health_check():
-    services = { "db": db_handler is not None, "interview": interview_service is not None, "behavioral": behavioral_analyzer is not None, "transcript_parser": transcript_parser is not None, "transcript_analyzer": transcript_analyzer is not None, "meet_mgr": meet_session_mgr is not None, "orchestrator": meet_orchestrator is not None }
+    # --- MODIFIED: Check for combined_analyzer ---
+    services = { 
+        "db": db_handler is not None, 
+        "interview": interview_service is not None, 
+        "combined_analyzer": combined_analyzer is not None, # (Replaces behavioral)
+        "transcript_parser": transcript_parser is not None, 
+        "transcript_analyzer": transcript_analyzer is not None, 
+        "meet_mgr": meet_session_mgr is not None, 
+        "orchestrator": meet_orchestrator is not None 
+    }
     healthy = all(services.values())
     return { "status": "healthy" if healthy else "degraded", "services": services }
 

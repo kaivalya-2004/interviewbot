@@ -1,7 +1,7 @@
 # app/services/meet_controller.py
 """
 Google Meet Controller - Handles browser automation for Google Meet
-UPDATED: Improved participant counting logic.
+UPDATED: Corrected participant counting logic to find unique IDs.
 """
 import logging
 import time
@@ -23,7 +23,7 @@ class MeetController:
 
     def __init__(
         self,
-        headless: bool = True, # Set back to True
+        headless: bool = True, # Set to True for production
         audio_device_index: Optional[int] = None,
         user_data_dir: Optional[str] = None,
         use_vb_audio: bool = True
@@ -123,7 +123,6 @@ class MeetController:
 
             # Handle name input if needed
             try:
-                # Use a more general selector
                 name_input = WebDriverWait(self.driver, 10).until(
                     EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Enter your name'] | //input[@aria-label='Your name']"))
                 )
@@ -180,18 +179,16 @@ class MeetController:
             # Click join button
             try:
                 logger.info("Finding 'Join' button (will try for 60 seconds)...")
-                # Look for buttons containing the specific span text
                 join_locators = [
                     (By.XPATH, "//button[.//span[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'join now')]]"),
                     (By.XPATH, "//button[.//span[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'ask to join')]]")
                 ]
-
+                
                 join_button = None
                 start_time = time.time()
                 while time.time() - start_time < 60:
                     for locator_type, selector_string in join_locators:
                         try:
-                            # Use WebDriverWait for finding the button
                             element = WebDriverWait(self.driver, 2).until(
                                 EC.element_to_be_clickable((locator_type, selector_string))
                             )
@@ -200,27 +197,25 @@ class MeetController:
                                 logger.info(f"✅ Found clickable join button via {selector_string}")
                                 break
                         except TimeoutException:
-                            continue # Try next locator or wait
+                            continue
                     if join_button:
                         break
                     time.sleep(1)
 
                 if join_button:
-                    # Use JS click for robustness
                     self.driver.execute_script("arguments[0].click();", join_button)
                     logger.info("✅ Clicked join button (JS)")
                     time.sleep(8) # Wait for meeting connection
                 else:
                     logger.warning(f"Could not find join button after 60 seconds")
                     return False
-
+                    
             except Exception as e:
                 logger.error(f"❌ Failed to click join button: {e}", exc_info=True)
                 return False
-
+            
             # Verify join and turn on captions
             try:
-                # Wait for URL and document ready state
                 WebDriverWait(self.driver, 15).until(
                     lambda d: "meet.google.com/" in d.current_url and d.execute_script("return document.readyState") == "complete"
                 )
@@ -230,44 +225,36 @@ class MeetController:
                     logger.info("🎵 Bot is now listening via VB-Audio Cable")
 
                 logger.info("Waiting 5s before attempting to turn on captions...")
-                time.sleep(5) # Wait longer for UI elements after join
+                time.sleep(5)
                 self.turn_on_captions()
                 logger.info("Waiting 2s after caption attempt...")
-                time.sleep(2) # Wait after the click attempt
+                time.sleep(2)
 
                 return True
             except TimeoutException:
                 logger.error("❌ Failed to verify meeting join or page didn't complete loading")
                 return False
-
+                
         except Exception as e:
             logger.error(f"❌ Error joining meeting: {e}", exc_info=True)
             return False
-
+    
     def turn_on_captions(self):
         """Turns on captions in the Google Meet call using JS."""
         try:
             if not self.driver: return
             logger.info("Attempting to turn on captions (JS)...")
-
             js_enable_captions = """
-            function isVisible(elem) {
-                if (!elem) return false;
-                return !!( elem.offsetWidth || elem.offsetHeight || elem.getClientRects().length );
-            }
-            // Try direct button first
+            function isVisible(elem) { /* ... visibility check ... */ }
             let directCaptionButton = document.querySelector("button[aria-label*='Turn on captions' i]");
             if (directCaptionButton && isVisible(directCaptionButton)) {
                 directCaptionButton.click();
                 return 'direct';
             }
-            // If not found or not visible, try More options menu
             const moreOptionsButton = document.querySelector("button[aria-label*='More options' i]");
             if (!moreOptionsButton || !isVisible(moreOptionsButton)) return 'no_options';
             moreOptionsButton.click();
-            // Wait briefly for menu to open
             await new Promise(resolve => setTimeout(resolve, 600));
-            // Find Captions item within the menu
             let captionsMenuItem = Array.from(document.querySelectorAll("div[role='menuitem'] span, div[role='menuitem'] div"))
                                         .find(el => el.textContent.toLowerCase().includes('captions') && isVisible(el));
             if (captionsMenuItem) {
@@ -278,63 +265,46 @@ class MeetController:
                     return 'menu';
                 }
             }
-            // If we opened 'More options' but didn't find/click captions, click body to close menu
-            if (document.body) document.body.click(); // Click body only if menu was opened
+            if (document.body) document.body.click();
             return 'not_in_menu';
             """
-            result = self.driver.execute_script(f"return (async () => {{ {js_enable_captions} }})();")
+            result = self.driver.execute_script(f"return (async () => {{ {js_enable_captions.replace('/* ... visibility check ... */', 'if (!elem) return false; return !!( elem.offsetWidth || elem.offsetHeight || elem.getClientRects().length );')} }})();")
 
-            if result == 'direct':
-                logger.info("✅ Captions turned on (Method 1: Direct JS)")
-            elif result == 'menu':
-                logger.info("✅ Captions turned on (Method 2: More Options JS)")
-                time.sleep(0.5)
-            elif result == 'no_options':
-                 logger.warning("⚠️ Could not find 'More options' button or it wasn't visible (JS).")
-            elif result == 'not_in_menu':
-                logger.warning("⚠️ Found 'More options' but couldn't find visible 'Captions' item (JS).")
-            else:
-                 logger.warning(f"⚠️ Unexpected result from JS caption script: {result}")
-
-        except JavascriptException as e:
-             logger.error(f"❌ JavaScript error turning on captions: {e}")
-        except Exception as e:
-            logger.error(f"❌ Error turning on captions (JS): {e}", exc_info=True)
-
+            if result == 'direct': logger.info("✅ Captions turned on (Method 1: Direct JS)")
+            elif result == 'menu': logger.info("✅ Captions turned on (Method 2: More Options JS)"); time.sleep(0.5)
+            elif result == 'no_options': logger.warning("⚠️ Could not find 'More options' button (JS).")
+            elif result == 'not_in_menu': logger.warning("⚠️ Could not find 'Captions' item in menu (JS).")
+            else: logger.warning(f"⚠️ Unexpected caption script result: {result}")
+        except JavascriptException as e: logger.error(f"❌ JS error turning on captions: {e}")
+        except Exception as e: logger.error(f"❌ Error turning on captions: {e}", exc_info=True)
 
     def enable_microphone(self):
         """Enable microphone during call (for VB-Audio output)."""
         try:
-            if not self.driver:
-                return
+            if not self.driver: return
             js_script = """
             const mic_button = Array.from(document.querySelectorAll("div[data-is-muted='true'][aria-label*='microphone' i]"))
                                   .find(e => e.offsetParent !== null);
             if (mic_button) { mic_button.click(); return true; } return false;
             """
-            clicked = self.driver.execute_script(js_script)
-            if clicked: logger.info("🎤 Microphone enabled (JS)")
+            if self.driver.execute_script(js_script): logger.info("🎤 Microphone enabled (JS)")
             else: logger.debug("Microphone already enabled or button not found (JS).")
             time.sleep(0.5)
-        except Exception as e:
-            logger.debug(f"Error enabling microphone (JS): {e}")
-
+        except Exception as e: logger.debug(f"Error enabling microphone (JS): {e}")
+    
     def disable_microphone(self):
         """Disable microphone during call."""
         try:
-            if not self.driver:
-                return
+            if not self.driver: return
             js_script = """
             const mic_button = Array.from(document.querySelectorAll("div[data-is-muted='false'][aria-label*='microphone' i]"))
                                   .find(e => e.offsetParent !== null);
             if (mic_button) { mic_button.click(); return true; } return false;
             """
-            clicked = self.driver.execute_script(js_script)
-            if clicked: logger.info("🔇 Microphone disabled (JS)")
+            if self.driver.execute_script(js_script): logger.info("🔇 Microphone disabled (JS)")
             else: logger.debug("Microphone already disabled or button not found (JS).")
             time.sleep(0.5)
-        except Exception as e:
-            logger.debug(f"Error disabling microphone (JS): {e}")
+        except Exception as e: logger.debug(f"Error disabling microphone (JS): {e}")
 
     def capture_candidate_video_js(self) -> Optional[Tuple[bytes, int, int]]:
         """Capture candidate's video using JavaScript method."""
@@ -362,7 +332,7 @@ class MeetController:
             """
             result = self.driver.execute_script(js_script.replace("/* ... visibility check ... */", """
             if (!elem) return false; return !!( elem.offsetWidth || elem.offsetHeight || elem.getClientRects().length );
-            """)) # Inject visibility function
+            """))
             if result and result.get('data'):
                 data_url = result['data']
                 if data_url.startswith('data:image/jpeg;base64,'):
@@ -371,12 +341,12 @@ class MeetController:
                          image_bytes = base64.b64decode(base64_data)
                          width = result.get('width', 0); height = result.get('height', 0)
                          if width > 0 and height > 0: return (image_bytes, width, height)
-                         else: logger.debug("JS capture returned invalid dimensions."); return None
-                    except base64.binascii.Error as b64_error: logger.error(f"JS capture returned invalid base64 data: {b64_error}"); return None
-                else: logger.debug(f"JS capture returned unexpected data URL format: {data_url[:50]}..."); return None
+                         else: logger.debug("JS capture invalid dimensions."); return None
+                    except base64.binascii.Error as b64_error: logger.error(f"JS capture invalid base64: {b64_error}"); return None
+                else: logger.debug(f"JS capture unexpected format: {data_url[:50]}..."); return None
             return None
-        except JavascriptException as e: logger.error(f"JavaScript error during video capture: {e}"); return None
-        except Exception as e: logger.error(f"Unexpected error during JS video capture: {e}", exc_info=True); return None
+        except JavascriptException as e: logger.error(f"JS error video capture: {e}"); return None
+        except Exception as e: logger.error(f"Unexpected error JS video capture: {e}", exc_info=True); return None
 
     def capture_candidate_video_screenshot(self) -> Optional[bytes]:
         """Fallback: Capture candidate video using screenshot method."""
@@ -384,74 +354,72 @@ class MeetController:
             if not self.driver: return None
             logger.debug("Attempting screenshot capture (fallback)...")
             screenshot_bytes = self.driver.get_screenshot_as_png()
-            if screenshot_bytes: logger.debug("Screenshot capture successful."); return screenshot_bytes
-            else: logger.warning("Screenshot capture failed (returned empty)."); return None
-        except Exception as e: logger.error(f"Screenshot capture failed: {e}", exc_info=True); return None
+            if screenshot_bytes: logger.debug("Screenshot ok."); return screenshot_bytes
+            else: logger.warning("Screenshot empty."); return None
+        except Exception as e: logger.error(f"Screenshot fail: {e}", exc_info=True); return None
 
-    # --- MODIFIED: Participant count logic ---
+    # --- MODIFIED: Participant count logic to count UNIQUE IDs ---
     def get_participant_count(self) -> int:
-        """Get the number of participants in the meeting, including the bot."""
+        """Get the number of *unique* participants in the meeting, including the bot."""
         try:
             if not self.driver:
-                return 0 # Or 1 if we assume bot is always there? Let's return 0 if driver fails.
+                return 0
 
-            # Primary Method: Use JS to count visible participant elements
+            # Primary Method: Use JS to count unique data-participant-id attributes
             try:
                 js_script = """
-                return Array.from(document.querySelectorAll('[data-participant-id]'))
-                            .filter(el => !!( el.offsetWidth || el.offsetHeight || el.getClientRects().length ))
-                            .length;
+                const elements = document.querySelectorAll('[data-participant-id]');
+                const uniqueIds = new Set();
+                elements.forEach(el => {
+                    const id = el.getAttribute('data-participant-id');
+                    if (id) {
+                        uniqueIds.add(id);
+                    }
+                });
+                return uniqueIds.size;
                 """
                 count = self.driver.execute_script(js_script)
-                # This count *should* include the bot.
                 if count is not None and count >= 1:
-                    logger.debug(f"Participant count via JS querySelector('[data-participant-id]'): {count}")
+                    logger.debug(f"Participant count via unique JS IDs: {count}")
                     return count
                 else:
-                     logger.debug("JS querySelector('[data-participant-id]') returned 0 or None.")
+                     logger.debug("JS querySelector for unique IDs returned 0 or None. Trying fallbacks...")
             except Exception as e:
-                 logger.warning(f"JS participant count using '[data-participant-id]' failed: {e}. Trying alternative.")
+                 logger.warning(f"JS unique participant count failed: {e}. Trying fallbacks.")
 
-            # Fallback 1: Check the participant button text/label (can be fragile)
+            # Fallback 1: Check the participant button text/label
             try:
-                # Try finding the participant button text
                 participant_button = WebDriverWait(self.driver, 3).until(
                      EC.presence_of_element_located((By.XPATH, "//button[contains(@aria-label, 'participants (')] | //button[contains(@aria-label, 'Show everyone (')]" ))
                 )
                 button_text = participant_button.text or participant_button.get_attribute('aria-label')
                 import re
-                match = re.search(r'\((\d+)\)', button_text) # Look for count in parentheses
+                match = re.search(r'\((\d+)\)', button_text)
                 if match:
                     num = int(match.group(1))
-                    if num >= 1:
-                         logger.debug(f"Participant count via UI button text: {num}")
-                         return num
-            except Exception as e:
-                logger.debug(f"UI participant button count failed: {e}. Trying video count.")
+                    if num >= 1: logger.debug(f"Participant count via UI button: {num}"); return num
+            except Exception as e: logger.debug(f"UI participant button count fail: {e}. Trying video count.")
 
-            # Fallback 2: Count visible video elements (less reliable, might include previews)
+            # Fallback 2: Count visible video elements (less reliable)
             try:
                 js_script_videos = """
                 return Array.from(document.querySelectorAll('video'))
                             .filter(el => {
                                 const rect = el.getBoundingClientRect();
-                                return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length) && rect.width > 50 && rect.height > 50; // Visible and reasonable size
+                                return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length) && rect.width > 50 && rect.height > 50;
                             }).length;
                 """
                 count_videos = self.driver.execute_script(js_script_videos)
                 if count_videos is not None and count_videos >= 1:
                      logger.debug(f"Participant count via visible videos: {count_videos}")
-                     return count_videos # Assume this is the total count
-            except Exception as e:
-                 logger.warning(f"JS video count failed: {e}.")
-
+                     return count_videos
+            except Exception as e: logger.warning(f"JS video count fail: {e}.")
 
             logger.error("Could not determine participant count reliably. Returning 1 (assuming only bot).")
-            return 1 # Default to 1 (the bot) if all methods fail
-
+            return 1
         except Exception as e:
             logger.error(f"Critical error getting participant count: {e}", exc_info=True)
-            return 1 # Default to 1 on major error
+            return 1
     # --- END MODIFICATION ---
 
     def leave_meeting(self):
@@ -459,7 +427,7 @@ class MeetController:
         try:
             if not self.driver: return
             logger.info("👋 Leaving meeting...")
-            js_leave = """ /* ... js leave script ... */ """ # Keep JS leave script
+            js_leave = """ /* ... js leave script ... */ """
             try:
                 if self.driver.execute_script(js_leave.replace("/* ... js leave script ... */", """
                 const leaveButton = document.querySelector("button[aria-label*='Leave call' i], button[aria-label*='Hang up' i]");
@@ -469,7 +437,7 @@ class MeetController:
                 return false;
                 """)):
                     logger.info("✅ Left meeting (JS)"); time.sleep(2); return
-            except Exception as e: logger.warning(f"JS leave failed: {e}. Trying Selenium click.")
+            except Exception as e: logger.warning(f"JS leave failed: {e}. Trying Selenium.")
             try:
                 leave_selectors = [ "button[aria-label*='Leave call'][data-mdc-value='end_call']", "button[aria-label*='Leave call' i]", "button[aria-label*='Hang up' i]" ]
                 for selector in leave_selectors:
@@ -478,7 +446,7 @@ class MeetController:
                         leave_button.click(); logger.info("✅ Left meeting (Selenium)"); time.sleep(2); return
                     except TimeoutException: continue
                 logger.warning("Could not find leave button via Selenium, navigating away"); self.driver.get("about:blank")
-            except Exception as e: logger.warning(f"Error leaving meeting via Selenium: {e}"); self.driver.get("about:blank")
+            except Exception as e: logger.warning(f"Error leaving via Selenium: {e}"); self.driver.get("about:blank")
         except Exception as e: logger.error(f"Error in leave_meeting: {e}")
 
     def cleanup(self):
@@ -488,9 +456,9 @@ class MeetController:
                 logger.info("🧹 Cleaning up Chrome driver...")
                 try: self.driver.close(); self.driver.quit()
                 except Exception as e:
-                    logger.warning(f"Error during driver close/quit: {e}")
+                    logger.warning(f"Error driver close/quit: {e}")
                     try: self.driver.quit()
-                    except Exception as e_quit: logger.error(f"Force quit also failed: {e_quit}")
+                    except Exception as e_quit: logger.error(f"Force quit failed: {e_quit}")
                 self.driver = None; logger.info("✅ Chrome driver cleaned up")
         except Exception as e: logger.error(f"Error during cleanup: {e}")
 

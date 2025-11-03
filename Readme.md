@@ -94,7 +94,7 @@ GEMINI_API_KEY=your_gemini_api_key_here
 GOOGLE_APPLICATION_CREDENTIALS=path/to/google-cloud-credentials.json
 
 # MongoDB
-MONGO_URI=mongodb+srv://username:password@cluster.mongodb.net/
+MONGO_URI=your mongodb uri.
 
 # Model Configuration
 TRANSCRIPT_ANALYSIS_MODEL=gemini-2.5-pro

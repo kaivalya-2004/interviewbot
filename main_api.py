@@ -85,7 +85,7 @@ def start_and_conduct_interview_task(
 
         # --- 1. Start Bot & Join Meet ---
         logger.info(f"[Task: {session_id}] Starting bot...")
-        success = meet_session_mgr.start_bot_session( session_id, meet_link, candidate_id, audio_device, enable_video, False, video_capture_method )
+        success = meet_session_mgr.start_bot_session( session_id, meet_link, candidate_id, audio_device, enable_video, True, video_capture_method )
         if not success: logger.error(f"[Task: {session_id}] Bot failed to join Meet."); return
         logger.info(f"[Task: {session_id}] ✅ Bot joined Meet.")
 

@@ -20,16 +20,7 @@ from app.core.services.database_service import DBHandler
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Initialize Gemini model
-chat_model = None
-try:
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_api_key: raise ValueError("GEMINI_API_KEY not found.")
-    genai.configure(api_key=gemini_api_key)
-    chat_model = genai.GenerativeModel('gemini-2.5-flash')
-    logger.info("✅ Gemini API configured.")
-except Exception as e:
-    logger.error(f"❌ Failed to configure Gemini API: {e}")
+# --- NO MORE GLOBAL VARIABLE HERE ---
 
 class InterviewService:
     def __init__(self):
@@ -41,18 +32,34 @@ class InterviewService:
         self._latest_transcript_for_gemini: Dict[str, Optional[str]] = {}
         self._transcript_lock = threading.Lock()
 
+        # --- FIX: Initialize model as an INSTANCE variable ---
+        try:
+            gemini_api_key = os.getenv("GEMINI_API_KEY")
+            if not gemini_api_key: raise ValueError("GEMINI_API_KEY not found.")
+            genai.configure(api_key=gemini_api_key)
+            # This is now 'self.model', not 'chat_model'
+            self.model = genai.GenerativeModel('gemini-2.5-flash') 
+            logger.info("✅ Gemini API configured.")
+        except Exception as e:
+            logger.error(f"❌ Failed to configure Gemini API: {e}")
+            self.model = None # Set to None on failure
+        # --- END FIX ---
+
         logger.info("Initializing Google Cloud TTS client...")
         try:
             custom_endpoint = "texttospeech.googleapis.com:443"
             self.tts_client = texttospeech.TextToSpeechClient(client_options=ClientOptions(api_endpoint=custom_endpoint))
             logger.info(f"✅ Google Cloud TTS client loaded (Endpoint: {custom_endpoint}).")
             self.tts_voice = texttospeech.VoiceSelectionParams(language_code="en-IN", name="en-IN-Chirp3-HD-Alnilam")
+            
+            # --- MODIFICATION: Removed all incompatible params for Chirp voice ---
             self.tts_audio_config = texttospeech.AudioConfig(
-                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-                sample_rate_hertz=24000,
-                speaking_rate=0.9,
+                audio_encoding=texttospeech.AudioEncoding.LINEAR16
+                # Chirp models do not support sample_rate_hertz, pitch, or speaking_rate overrides.
             )
-            logger.info(f"Set TTS speaking rate to {self.tts_audio_config.speaking_rate}")
+            logger.info(f"Set TTS audio config for Chirp model (native 24kHz).")
+            # --- END MODIFICATION ---
+
         except Exception as e:
             logger.error(f"❌ Failed load TTS client: {e}")
             self.tts_client = None
@@ -60,7 +67,11 @@ class InterviewService:
     def start_new_interview(self, resume_text: str, candidate_id: str, questionnaire: List[str]) -> str:
         """Initializes Gemini chat and all tracking."""
         session_id = self.db.create_session(resume_text, candidate_id, questionnaire or [])
-        if not chat_model: raise RuntimeError("Gemini chat model failed.")
+        
+        # --- FIX: Use self.model ---
+        if not self.model: 
+            raise RuntimeError("Gemini chat model failed.")
+        # --- END FIX ---
         
         logger.info(f"Initializing Gemini chat for session {session_id}")
         
@@ -71,31 +82,36 @@ class InterviewService:
         else: 
             questionnaire_context = "\n**Reference Questionnaire:** Not provided."
 
-        # --- MODIFIED SYSTEM PROMPT ---
-        # This prompt is now shorter and explicitly asks for brief, general questions.
+        # --- MODIFICATION: More specific SSML instructions for pauses ---
         system_prompt = f"""
 You are an AI Interviewer. Your role is to conduct a professional, conversational interview.
+Your responses MUST be wrapped in <speak> tags.
 
-**Your Primary Goal:**
-Assess the candidate's skills and experience based on their resume and their responses.
+**IMPORTANT:** To sound natural, you MUST add a pause after punctuation.
+- Use <break time='700ms'/> after commas.
+- Use <break time='1000ms'/> (1 second) after full stops (periods), question marks, or exclamation marks.
+- Use <emphasis> tags to stress key words.
+- Your questions must be **very short and direct, ideally under 15 words.** They must be concise, clear, and conversational. Ask only one question at a time.
 
-**Critical Instructions:**
-1.  **Keep Questions Short:** Ask clear, concise, and general questions. Aim for 1-2 sentences maximum.
-2.  **Be Conversational:** Do not ask long, complex, or multi-part questions. Maintain a natural, flowing conversation.
-3.  **Use the Context:** Refer to the candidate's resume and the provided questionnaire (if any) to guide your questions, but frame them generally.
-4.  **Flow:** Start with an introductory question and adapt based on the candidate's last answer.
+Your primary goal is to assess the candidate's skills, experience, and suitability for a role. You must be professional, polite, and curious. You will be provided with the candidate's resume and an optional list of topics to guide the conversation.
 
 **Candidate Resume:**
 ---
 {resume_text}
 ---
-
 {questionnaire_context}
 
 **Task:**
-You will receive the candidate's responses one by one. After each response, generate the *next logical question*. Remember to keep it short and general. Do not greet the candidate or add filler text; just ask the question.
+1.  You will be given the transcript of the candidate's last answer.
+2.  Your job is to generate the *next* logical question.
+3.  This question **must** be relevant to their previous answer AND the context from their **Resume**.
+4.  Use the **Reference Questionnaire** as a high-level guide for key topics to cover, but do not just ask the questions verbatim.
+5.  Ask open-ended questions (e.g., "Why did you choose that approach?", "What was the main challenge?", "How did that project turn out?").
+6.  Actively listen and ask relevant follow-up questions. For example, if they mention a project from their resume, ask about a specific challenge they faced in that project.
+7.  Do not repeat questions.
+8.  When the interview is concluding, your final response should be a polite closing remark (e.g., "<speak>Thank you for your time today. <break time='1000ms'/> That concludes our interview.</speak>").
 """
-        # --- END MODIFIED SYSTEM PROMPT ---
+        # --- END MODIFICATION ---
         
         try:
             self._session_token_counts[session_id] = {'prompt': 0, 'response': 0, 'total': 0}
@@ -103,13 +119,16 @@ You will receive the candidate's responses one by one. After each response, gene
             with self._transcript_lock: self._latest_transcript_for_gemini[session_id] = "[Candidate introduction pending]"
             
             # Initialize chat history
-            self.active_chat_sessions[session_id] = chat_model.start_chat(
+            # --- FIX: Use self.model ---
+            self.active_chat_sessions[session_id] = self.model.start_chat(
                 history=[
                     {'role': 'user', 'parts': [system_prompt]},
-                    {'role': 'model', 'parts': ["Understood. I will ask short, general questions based on the context. Ready for the candidate's introduction."]}
+                    # --- MODIFICATION: Update model's example response to use SSML ---
+                    {'role': 'model', 'parts': ["<speak>Understood. <break time='700ms'/> I will ask short, clear, and conversational questions using SSML with pauses after punctuation. <break time='1000ms'/> Ready for the candidate's introduction.</speak>"]}
                 ]
             )
-            logger.info(f"✅ Gemini chat session initialized for {session_id} with new brief prompt.")
+            # --- END FIX ---
+            logger.info(f"✅ Gemini chat session initialized for {session_id} with SSML prompt.")
             
         except Exception as e:
             # Clean up on failure
@@ -123,10 +142,12 @@ You will receive the candidate's responses one by one. After each response, gene
 
     def generate_initial_greeting(self) -> str:
         """Provides the opening greeting with instructions."""
-        return ("Hello and welcome. I am your AI interviewer. "
-                "For our session today, please ensure your camera is turned on and remains on throughout the interview. "
+        # --- MODIFICATION: "A. I." to fix pronunciation ---
+        return ("<speak>Hello and welcome. <break time='300ms'/> I am your Interviewer for today. "
+                "For our session today, <break time='200ms'/> please ensure your camera is turned on and remains on throughout the interview. "
                 "Also, please make sure your microphone is enabled when you are speaking. "
-                "To start, please introduce yourself.")
+                "<break time='500ms'/> Let's get started. "
+                "<break time='500ms'/> Please introduce yourself.</speak>")
 
     def _save_audio_thread( self, audio_data: np.ndarray, sample_rate: int, audio_path: str, session_id: str, text: str, is_follow_up: bool ):
         try: 
@@ -141,25 +162,32 @@ You will receive the candidate's responses one by one. After each response, gene
             logger.error("TTS client N/A."); 
             return None, None
         try:
-            audio_dir = Path("data") / candidate_id / "audio"; audio_dir.mkdir(parents=True, exist_ok=True)
+            # --- MODIFICATION: Standardized audio path ---
+            audio_dir = Path("data") / candidate_id / session_id / "audio"
+            audio_dir.mkdir(parents=True, exist_ok=True)
+            # --- END MODIFICATION ---
+
             suffix = "_followup" if is_follow_up else ""; audio_path = audio_dir / f"bot_{session_id}_{turn_count}{suffix}_24k.wav"
             
-            # Clean text of Markdown symbols (*, _, #) before sending to TTS
-            cleaned_text_for_tts = re.sub(r'[#\*_]', '', text)
+            # --- This line is not needed when sending SSML ---
+            ##cleaned_text_for_tts = re.sub(r'[#\*_]', '', text)#
             
-            synthesis_input = texttospeech.SynthesisInput(text=cleaned_text_for_tts) # (Use cleaned text)
-            char_count = len(cleaned_text_for_tts) # (Count cleaned text)
+            # --- This is correct: it assumes 'text' is valid SSML ---
+            synthesis_input = texttospeech.SynthesisInput(ssml=text)
+            char_count = len(text) 
             
             self._session_tts_char_counts[session_id] += char_count
             
-            # Log the original text for context, but note the cleaned char count
-            logger.info(f"Generating TTS audio ({char_count} cleaned chars){' (followup)' if is_follow_up else ''}: '{text[:50]}...'")
+            # --- MODIFICATION: Fixed misleading log message ---
+            logger.info(f"Generating TTS audio ({char_count} SSML chars){' (followup)' if is_follow_up else ''}: '{text[:50]}...'")
             
             response = self.tts_client.synthesize_speech( input=synthesis_input, voice=self.tts_voice, audio_config=self.tts_audio_config )
             logger.info("✅ TTS received.")
-            audio_data = np.frombuffer(response.audio_content, dtype=np.int16); sample_rate = self.tts_audio_config.sample_rate_hertz
             
-            # Save the *original* text (with markdown) to the database log
+            audio_data = np.frombuffer(response.audio_content, dtype=np.int16); 
+            # --- This is correct: hard-coded sample rate for Chirp model ---
+            sample_rate = 24000
+            
             save_thread = threading.Thread( target=self._save_audio_thread, args=(audio_data, sample_rate, audio_path, session_id, text, is_follow_up), daemon=True )
             save_thread.start()
             
@@ -228,12 +256,18 @@ You will receive the candidate's responses one by one. After each response, gene
             
             if not next_question or len(next_question) < 5: 
                 logger.warning("Gemini Q short/empty, fallback.")
-                return "Tell me more about a project you're proud of."
+                # --- MODIFICATION: Make sure fallback is also SSML ---
+                return "<speak>Tell me more about a project you're proud of.</speak>"
+            
+            # --- MODIFICATION: Ensure response is valid SSML ---
+            if not next_question.startswith("<speak>") or not next_question.endswith("</speak>"):
+                logger.warning("Gemini response was not valid SSML. Wrapping it...")
+                next_question = f"<speak>{next_question}</speak>"
                 
             return next_question
         except Exception as e: 
             logger.error(f"Gemini generate fail: {e}", exc_info=True)
-            return "Apologies, an error occurred. What is a key skill you possess?"
+            return "<speak>Apologies, <break time='500ms'/> an error occurred. What is a key skill you possess?</speak>"
 
     def process_and_log_transcript(
         self, session_id: str, audio_path: str, turn_count: int,
@@ -248,7 +282,6 @@ You will receive the candidate's responses one by one. After each response, gene
             self.db.add_message_to_session(session_id, "user", transcript, audio_path, start_time, end_time, is_follow_up=is_follow_up_response)
             
             with self._transcript_lock:
-                # Update only if transcription was reasonably successful
                 if not transcript.startswith("[Error") and transcript != "[Unintelligible]":
                     self._latest_transcript_for_gemini[session_id] = transcript
                     logger.info(f"(BG Thread) Updated latest transcript for session {session_id}")
@@ -257,7 +290,7 @@ You will receive the candidate's responses one by one. After each response, gene
         except Exception as e:
             logger.error(f"(BG Thread) Error in process_and_log_transcript: {e}", exc_info=True)
             try: 
-                self.db.add_message_to_session(session_id, "user", transcript, audio_path, start_time, end_time, is_follow_up=is_follow_up_response) # Log even on error
+                self.db.add_message_to_session(session_id, "user", transcript, audio_path, start_time, end_time, is_follow_up=is_follow_up_response)
             except Exception as db_e: 
                 logger.error(f"(BG Thread) Failed log audio error to DB: {db_e}")
 
@@ -274,9 +307,7 @@ You will receive the candidate's responses one by one. After each response, gene
         transcript_path = transcript_dir / f"transcript_{session_id}.txt"
         
         try:
-            # --- THIS IS THE FIX ---
             with open(transcript_path, "w", encoding="utf-8") as f:
-            # --- END OF FIX ---
                 f.write(f"--- Interview Transcript ---\nSession ID: {session_id}\nCandidate ID: {candidate_id}\n")
                 created_at = session_data.get('created_at')
                 f.write(f"Date: {created_at.strftime('%Y-%m-%d %H:%M:%S')}\n" if created_at else "Date: N/A\n")

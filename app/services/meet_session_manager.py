@@ -73,6 +73,11 @@ class MeetSessionManager:
                      if not current_controller: logger.warning("Ctrl missing in capture loop."); break
                      current_time = time.time()
                      if current_time - last_capture_time >= capture_interval:
+                         # --- RECOMMENDED FIX APPLIED ---
+                         # Set time on attempt, not just success, to prevent rapid-fire failures
+                         last_capture_time = current_time
+                         # --- END FIX ---
+                         
                          stats['total_attempts'] += 1; screenshot_data = None; width = 640; height = 480
                          if capture_method == "javascript":
                              result = current_controller.capture_candidate_video_js()
@@ -93,7 +98,7 @@ class MeetSessionManager:
                              except Exception as img_e: logger.error(f"Save snapshot fail: {img_e}"); stats['failed_captures'] += 1; consecutive_failures += 1; continue
                              session['snapshot_count'] += 1; stats['successful_captures'] += 1
                              if session['snapshot_count'] % 5 == 0: method_used = "JS" if stats['js_captures'] >= stats['screenshot_captures'] else "Scr"; logger.info(f"📸 Snaps: {session['snapshot_count']} ({method_used}) | Rate: {stats['successful_captures']}/{stats['total_attempts']}")
-                             last_capture_time = current_time
+                             # last_capture_time = current_time  <- This was the old, incorrect position
                          else: # Handle failure
                              stats['failed_captures'] += 1; consecutive_failures += 1; logger.warning(f"Capture fail #{stats['total_attempts']} (Consec: {consecutive_failures})")
                              if consecutive_failures >= max_consecutive_failures: logger.error(f"❌ Max capture fails ({max_consecutive_failures}). Stopping."); break

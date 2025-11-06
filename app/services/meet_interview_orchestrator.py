@@ -1,6 +1,7 @@
 # app/services/meet_interview_orchestrator.py
 import logging
 import time
+from time import sleep as sleep
 import sounddevice as sd
 import soundfile as sf
 import numpy as np
@@ -9,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 import queue
 import threading
-import librosa # Needed for resampling recorded audio
+# import librosa # --- REMOVED ---
 
 from app.services.meet_session_manager import MeetSessionManager
 from app.services.interview_service import InterviewService
@@ -31,11 +32,38 @@ class MeetInterviewOrchestrator:
     ):
         self.session_mgr = session_manager
         self.interview_svc = interview_service
-        self.virtual_output = VirtualAudioConfig.get_virtual_output_device()
-        self.virtual_input = VirtualAudioConfig.get_virtual_input_device()
+        
+        # --- START MODIFICATION: Manually find audio devices ---
+        # Manually define the device names
+        self.BOT_PLAYBACK_DEVICE_NAME = "CABLE Input (VB-Audio Virtual Cable)" 
+        self.BOT_RECORDING_DEVICE_NAME = "CABLE Output (VB-Audio Virtual Cable)"
         self.target_samplerate = 24000
-        if self.virtual_output is None or self.virtual_input is None:
-            logger.warning("⚠️ Virtual audio devices not configured properly!")
+        
+        try:
+            devices = sd.query_devices()
+            # Find the device to PLAY audio TO (Bot's Speaker)
+            self.virtual_output = next(
+                d['index'] for d in devices 
+                if self.BOT_PLAYBACK_DEVICE_NAME in d['name'] and d['max_output_channels'] > 0
+            )
+            # Find the device to RECORD audio FROM (Bot's Microphone)
+            self.virtual_input = next(
+                d['index'] for d in devices 
+                if self.BOT_RECORDING_DEVICE_NAME in d['name'] and d['max_input_channels'] > 0
+            )
+            logger.info(f"✅ Found VB-Audio Playback (Output): {self.virtual_output} ('{self.BOT_PLAYBACK_DEVICE_NAME}')")
+            logger.info(f"✅ Found VB-Audio Recording (Input): {self.virtual_input} ('{self.BOT_RECORDING_DEVICE_NAME}')")
+        
+        except StopIteration:
+            logger.critical("❌ CRITICAL: Could not find VB-Audio devices by name.")
+            logger.critical("Bot will play to speakers and will not hear the candidate.")
+            self.virtual_output = None # This will cause playback on default speakers
+            self.virtual_input = None  # This will record from default mic
+        except Exception as e:
+            logger.error(f"Error finding audio devices: {e}")
+            self.virtual_output = None
+            self.virtual_input = None
+        # --- END MODIFICATION ---
 
     def conduct_interview(
         self,
@@ -79,9 +107,12 @@ class MeetInterviewOrchestrator:
         
         playback_ok = True
         if greeting_audio_data is not None:
+            # --- MODIFICATION: Need to pass librosa resample here if TTS is not 24k ---
+            # Assuming TTS service provides self.target_samplerate (24k)
+            # If not, we need to resample the *playback* audio
             playback_ok = self._play_audio_data(greeting_audio_data, self.target_samplerate, meet, stop_event)
         
-        # --- MODIFIED: Handle drop during greeting ---
+        # --- Handle drop during greeting ---
         if not playback_ok:
             logger.warning("Playback stopped early during greeting (candidate left or terminated).")
             # Enter rejoin loop
@@ -97,17 +128,15 @@ class MeetInterviewOrchestrator:
                 if stop_event and stop_event.is_set(): logger.info("Manually terminated during rejoin wait.")
                 else: logger.error(f"❌ Candidate did not rejoin. Terminating.");
                 if stop_event: stop_event.set(); session['termination_reason'] = "candidate_left";
-                # Fall through to end of function, loop won't start
             else:
                 playback_ok = True # Reset flag to allow main loop to start
-        # --- END MODIFICATION ---
         
         time.sleep(0.5)
 
         intro_text = "[Recording skipped due to early exit]"
         if playback_ok and not (stop_event and stop_event.is_set()): # Only listen if playback was ok
             logger.info("🎤 Listening for candidate's introduction...")
-            active_stt_thread, rec_start_time = self._record_and_process_stt_background( session_id, turn_count, candidate_id, duration=30, is_follow_up_response=False )
+            active_stt_thread, rec_start_time = self._record_and_process_stt_background( session_id, turn_count, candidate_id, duration=60, is_follow_up_response=False )
             intro_turn = turn_count
             turn_count += 1
             logger.info("Disabling mic after intro..."); meet.disable_microphone(); logger.info("Mic disabled.")
@@ -153,7 +182,9 @@ class MeetInterviewOrchestrator:
                     logger.error(f"❌ Participant count increased to {current_participant_count}. Terminating.")
                     if stop_event: stop_event.set()
                     session['termination_reason'] = "multiple_participants"
-                    termination_msg = "It appears there are extra participants in the call. For interview integrity, we must end the session now. Thank you."
+                    termination_msg = ("<speak>It appears there are extra participants in the call. <break time='1000ms'/> "
+                                       "For interview integrity, <break time='700ms'/> we must end the session now. <break time='1000ms'/> "
+                                       "Thank you.</speak>")
                     logger.info(f"🤖 Bot: {termination_msg}")
                     meet.enable_microphone(); time.sleep(0.5)
                     term_audio_data, _ = self.interview_svc.text_to_speech( termination_msg, session_id, turn_count, candidate_id )
@@ -201,7 +232,7 @@ class MeetInterviewOrchestrator:
             if question_audio_data is not None:
                 playback_ok = self._play_audio_data(question_audio_data, self.target_samplerate, meet, stop_event)
             
-            # --- MODIFIED: Handle drop during question playback ---
+            # --- Handle drop during question playback ---
             if not playback_ok:
                  logger.warning("Playback stopped early (candidate left or terminated).")
                  
@@ -226,12 +257,11 @@ class MeetInterviewOrchestrator:
                     turn_count -= 1 # Decrement turn count for TTS filename
                     playback_ok = True # Reset flag
                     continue # Restart main while loop
-            # --- END MODIFICATION ---
             
             time.sleep(0.5)
 
             # Record response & start background processing
-            logger.info("🎤 Listening..."); active_stt_thread, rec_start_time = self._record_and_process_stt_background( session_id, turn_count, candidate_id, duration=30, is_follow_up_response=False )
+            logger.info("🎤 Listening..."); active_stt_thread, rec_start_time = self._record_and_process_stt_background( session_id, turn_count, candidate_id, duration=60, is_follow_up_response=False )
             current_turn = turn_count; turn_count += 1
             logger.info("Disabling mic..."); meet.disable_microphone(); logger.info("Mic disabled.")
             if stop_event and stop_event.is_set(): logger.info("Stop signal after starting STT."); break
@@ -250,6 +280,7 @@ class MeetInterviewOrchestrator:
 
         # Closing statement
         closing_reason = "Allocated time is up."; termination_reason = session.get('termination_reason', None)
+        final_elapsed = time.time() - start_time # Define final_elapsed here
         try: last_participant_count = meet.get_participant_count()
         except: last_participant_count = 2 # Assume normal if check fails
         
@@ -258,13 +289,15 @@ class MeetInterviewOrchestrator:
              elif termination_reason == "candidate_left": closing_reason = "The candidate left the meeting."
              else: closing_reason = "The interview was ended early."
         elif questions_asked_count >= max_questions: closing_reason = "We have reached the question limit."
-        elif not (remaining_time < ESTIMATED_TURN_DURATION_SECONDS or final_elapsed >= interview_duration_seconds):
-            closing_reason = "We have completed the interview."
+        elif 'remaining_time' in locals() and not (remaining_time < ESTIMATED_TURN_DURATION_SECONDS or final_elapsed >= interview_duration_seconds):
+             # This condition might be met if loop broke for other reasons but time wasn't up
+             closing_reason = "We have completed the interview."
 
         if termination_reason == "multiple_participants": logger.info("Skipping generic closing (multi-participant).")
         elif termination_reason == "candidate_left": logger.info("Skipping closing statement (candidate left).")
         else:
-             closing_text = f"Thank you for your time. {closing_reason} That concludes our interview today."
+             closing_text = (f"<speak>Thank you for your time. <break time='1000ms'/> {closing_reason} "
+                             f"<break time='1000ms'/> That concludes our interview today.</speak>")
              logger.info(f"🤖 Bot: {closing_text}")
              meet.enable_microphone(); time.sleep(0.5)
              closing_audio_data, _ = self.interview_svc.text_to_speech( closing_text, session_id, turn_count, candidate_id )
@@ -277,9 +310,10 @@ class MeetInterviewOrchestrator:
 
         logger.info("✅ Interview orchestration function finished.")
 
-        final_status = "unknown"; final_elapsed = time.time() - start_time
+        final_status = "unknown"
         if stop_event and stop_event.is_set(): final_status = "terminated"
-        elif remaining_time < ESTIMATED_TURN_DURATION_SECONDS or final_elapsed >= interview_duration_seconds : final_status = "time_limit_reached"
+        elif 'remaining_time' in locals() and remaining_time < ESTIMATED_TURN_DURATION_SECONDS: final_status = "time_limit_reached"
+        elif final_elapsed >= interview_duration_seconds : final_status = "time_limit_reached"
         elif questions_asked_count >= max_questions: final_status = "max_questions_reached"
         else: final_status = "completed"
 
@@ -287,22 +321,30 @@ class MeetInterviewOrchestrator:
 
     def _play_audio_data(self, audio_data: np.ndarray, sample_rate: int, meet: MeetController, stop_event: threading.Event) -> bool:
         """Play audio data using non-blocking stream, monitoring for drops/stop."""
+        
+        # --- MODIFICATION: Need to ensure playback is at target_samplerate ---
+        # We need librosa for this one part.
         try:
+            import librosa
+        except ImportError:
+            logger.error("Librosa not installed. Cannot resample playback audio!")
+            # Fallback: Try to play as-is, which might fail or be wrong speed
+            pass
+
+        try:
+            data_float = audio_data.astype(np.float32)
+            if audio_data.dtype == np.int16:
+                data_float /= 32768.0
+            
             if sample_rate != self.target_samplerate:
                 logger.warning(f"⚠️ Playback SR mismatch! Expected {self.target_samplerate}, got {sample_rate}. Resampling...")
                 try:
-                    data_float = audio_data.astype(np.float32) / 32768.0 if audio_data.dtype == np.int16 else audio_data.astype(np.float32)
                     data_float = librosa.resample(data_float, orig_sr=sample_rate, target_sr=self.target_samplerate)
                 except Exception as resample_e:
                     logger.error(f"On-the-fly resampling failed: {resample_e}. Playing as-is.")
-                    if audio_data.dtype == np.int16: data_float = audio_data.astype(np.float32) / 32768.0
-                    elif audio_data.dtype != np.float32: data_float = audio_data.astype(np.float32)
-                    else: data_float = audio_data
-            else:
-                 if audio_data.dtype == np.int16: data_float = audio_data.astype(np.float32) / 32768.0
-                 elif audio_data.dtype != np.float32: data_float = audio_data.astype(np.float32)
-                 else: data_float = audio_data
-
+                    # Cannot proceed if samplerates don't match and resample fails
+                    return False # Or play as-is and hope
+            
             logger.info(f"📥 Playing audio data: {self.target_samplerate}Hz, {len(data_float)} samples")
             
             if len(data_float.shape) > 1: data_float = np.mean(data_float, axis=1)
@@ -359,37 +401,51 @@ class MeetInterviewOrchestrator:
             logger.error(f"❌ Failed to play audio data: {e}", exc_info=True)
             return False
 
-    def _get_stt_audio_path(self, session_id: str, turn_count: int, candidate_id: str, is_follow_up: bool) -> Path:
-        audio_dir = Path("data") / "audio" / candidate_id / session_id
+    # --- START MODIFICATION: Renamed and simplified ---
+    def _get_user_audio_path_for_stt(self, session_id: str, turn_count: int, candidate_id: str, is_follow_up: bool) -> Path:
+        """Gets the path for the 24k (stt) user audio."""
+        # Standardized path: data/<candidate_id>/<session_id>/audio/
+        audio_dir = Path("data") / candidate_id / session_id / "audio"
+        audio_dir.mkdir(parents=True, exist_ok=True)
         suffix = "_followup" if is_follow_up else ""
-        return audio_dir / f"candidate_turn_{turn_count}{suffix}_stt_16k.wav"
+        
+        # Save as 24k, since that's what we recorded
+        path_24k_stt = audio_dir / f"candidate_turn_{turn_count}{suffix}_stt_24k.wav"
+        
+        return path_24k_stt
+    # --- END MODIFICATION ---
 
-    def _save_stt_audio_thread_func(
+    # --- START MODIFICATION: Simplified save function (no librosa) ---
+    def _save_and_process_audio_thread_func(
         self,
         recording_data: np.ndarray,
-        original_samplerate: int,
-        audio_path_16k: Path,
+        original_samplerate: int, # This will be 24000
+        audio_path_for_stt: Path,  # This is the 24k path
         session_id: str,
         turn_count: int,
         candidate_id: str,
         start_time: Optional[datetime],
         is_follow_up_response: bool
     ):
-        """Resamples, saves, AND transcribes/logs audio in background."""
+        """Saves 24k audio AND transcribes/logs it in background."""
         try:
-            target_samplerate = 16000
-            logger.debug(f"(BG Thread {turn_count}) Starting STT audio prep for {audio_path_16k}...")
-            recording_float = recording_data.flatten().astype(np.float32)
-            recording_16k = librosa.resample( recording_float, orig_sr=original_samplerate, target_sr=target_samplerate )
-            sf.write(str(audio_path_16k), recording_16k, target_samplerate, format='WAV', subtype='PCM_16')
-            logger.info(f"(BG Thread {turn_count}) 💾 STT recording saved: {audio_path_16k}")
+            # --- Save the original 24k audio ---
+            logger.debug(f"(BG Thread {turn_count}) Saving 24k audio for STT to {audio_path_for_stt}...")
+            sf.write(str(audio_path_for_stt), recording_data.flatten(), original_samplerate, format='WAV', subtype='PCM_16')
+            logger.info(f"(BG Thread {turn_count}) 💾 24k (STT) recording saved: {audio_path_for_stt}")
+            
+            # --- Process transcript using the 24k file ---
             self.interview_svc.process_and_log_transcript(
-                 session_id, str(audio_path_16k), turn_count, candidate_id,
+                 session_id, str(audio_path_for_stt), # <-- Use 24k path
+                 turn_count, candidate_id,
                  start_time, datetime.now(),
                  is_follow_up_response
             )
-        except ImportError: logger.critical("❌ Librosa or SoundFile missing!")
-        except Exception as err: logger.error(f"(BG Thread {turn_count}) Error processing STT audio: {err}", exc_info=True)
+        except ImportError: 
+            logger.critical("❌ SoundFile missing!") # No longer need librosa
+        except Exception as err: 
+            logger.error(f"(BG Thread {turn_count}) Error processing STT audio: {err}", exc_info=True)
+    # --- END MODIFICATION ---
 
 
     def _record_and_process_stt_background(
@@ -397,11 +453,11 @@ class MeetInterviewOrchestrator:
         session_id: str,
         turn_count: int,
         candidate_id: str,
-        duration: int = 60,
+        duration: int = 120,
         is_follow_up_response: bool = False
     ) -> Tuple[Optional[threading.Thread], Optional[datetime]]:
         """
-        Records audio, starts background save/resample/transcribe, returns thread & start time.
+        Records audio, starts background save/transcribe, returns thread & start time.
         """
         stream = None; q = queue.Queue(); stream_closed = threading.Event(); recording_start_time = None
         try:
@@ -448,21 +504,33 @@ class MeetInterviewOrchestrator:
             if not recorded_chunks: logger.warning("No audio data."); return None, recording_start_time
             recording_data = np.concatenate(recorded_chunks, axis=0)
             logger.info(f"Recording finished. Duration: {len(recording_data)/samplerate:.2f}s")
-            # Start Background Processing Thread
-            audio_path_16k = self._get_stt_audio_path(session_id, turn_count, candidate_id, is_follow_up_response)
-            audio_path_16k.parent.mkdir(parents=True, exist_ok=True)
+            
+            # --- START MODIFICATION: Get 24k STT path ---
+            audio_path_stt = self._get_user_audio_path_for_stt(
+                session_id, turn_count, candidate_id, is_follow_up_response
+            )
+            # --- END MODIFICATION ---
 
             processing_thread = threading.Thread(
-                target=self._save_stt_audio_thread_func, # Corrected function name
-                 args=( recording_data, samplerate, audio_path_16k, session_id, turn_count, candidate_id, recording_start_time, is_follow_up_response ),
+                target=self._save_and_process_audio_thread_func, # <-- Renamed
+                 # --- MODIFICATION: Pass 24k STT path ---
+                 args=( 
+                     recording_data, samplerate, 
+                     audio_path_stt, #<-- Updated arg
+                     session_id, turn_count, candidate_id, 
+                     recording_start_time, is_follow_up_response 
+                 ),
                  daemon=True, name=f"STTProcess-{turn_count}" )
 
             processing_thread.start()
             logger.info(f"Background STT processing thread started (Turn {turn_count})")
             return processing_thread, recording_start_time
         except sd.PortAudioError as pae: logger.error(f"❌ PortAudioError: {pae}"); return None, recording_start_time
-        except ImportError: logger.critical("❌ Librosa/SoundFile missing!"); return None, recording_start_time
-        except Exception as e: logger.error(f"❌ Error recording: {e}", exc_info=True); return None, recording_start_time
+        except ImportError: 
+            logger.critical("❌ SoundFile missing!") # No longer need librosa
+            return None, recording_start_time
+        except Exception as e: 
+            logger.error(f"❌ Error recording: {e}", exc_info=True); return None, recording_start_time
         finally:
              if stream and not stream.closed:
                   try: stream.abort(ignore_errors=True); stream.close(); logger.debug("Stream closed finally.")

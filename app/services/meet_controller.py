@@ -2,6 +2,7 @@
 """
 Google Meet Controller - Handles browser automation for Google Meet
 UPDATED: Corrected participant counting logic to find unique IDs.
+MODIFIED: Removed automatic caption enabling to speed up bot join time.
 """
 import logging
 import time
@@ -214,7 +215,7 @@ class MeetController:
                 logger.error(f"❌ Failed to click join button: {e}", exc_info=True)
                 return False
             
-            # Verify join and turn on captions
+            # Verify join
             try:
                 WebDriverWait(self.driver, 15).until(
                     lambda d: "meet.google.com/" in d.current_url and d.execute_script("return document.readyState") == "complete"
@@ -224,11 +225,14 @@ class MeetController:
                 if self.use_vb_audio:
                     logger.info("🎵 Bot is now listening via VB-Audio Cable")
 
-                logger.info("Waiting 5s before attempting to turn on captions...")
-                time.sleep(5)
-                self.turn_on_captions()
-                logger.info("Waiting 2s after caption attempt...")
-                time.sleep(2)
+                # --- MODIFICATION: Removed caption logic ---
+                # logger.info("Waiting 5s before attempting to turn on captions...")
+                # time.sleep(5)
+                # self.turn_on_captions()
+                # logger.info("Waiting 2s after caption attempt...")
+                # time.sleep(2)
+                logger.info("Join verified. Proceeding without enabling captions.")
+                # --- END MODIFICATION ---
 
                 return True
             except TimeoutException:
@@ -239,88 +243,90 @@ class MeetController:
             logger.error(f"❌ Error joining meeting: {e}", exc_info=True)
             return False
     
-    def turn_on_captions(self):
-        """Turns on captions in the Google Meet call using JS."""
-        try:
-            if not self.driver: return
-            logger.info("Attempting to turn on captions (JS)...")
+    # --- MODIFICATION: Commented out entire turn_on_captions method ---
+    # def turn_on_captions(self):
+    #     """Turns on captions in the Google Meet call using JS."""
+    #     try:
+    #         if not self.driver: return
+    #         logger.info("Attempting to turn on captions (JS)...")
             
-            # --- MODIFIED JAVASCRIPT ---
-            js_enable_captions = """
-            function isVisible(elem) { /* ... visibility check ... */ }
+    #         # --- MODIFIED JAVASCRIPT ---
+    #         js_enable_captions = """
+    #         function isVisible(elem) { /* ... visibility check ... */ }
             
-            // Try 1: Direct "Turn on captions" button
-            let directCaptionButton = document.querySelector("button[aria-label*='Turn on captions' i]");
-            if (directCaptionButton && isVisible(directCaptionButton)) {
-                directCaptionButton.click();
-                return 'direct';
-            }
+    #         // Try 1: Direct "Turn on captions" button
+    #         let directCaptionButton = document.querySelector("button[aria-label*='Turn on captions' i]");
+    #         if (directCaptionButton && isVisible(directCaptionButton)) {
+    #             directCaptionButton.click();
+    #             return 'direct';
+    #         }
 
-            // Try 2: Find "More options" button (3 dots)
-            // We try multiple selectors as this changes often
-            const optionsSelectors = [
-                "button[aria-label*='More options' i]",    // Original partial match
-                "button[aria-label='More options']",      // Exact match
-                "button[data-mdc-value*='More options' i]", // data-mdc-value
-                "button[aria-label*='Call controls' i]"  // Sometimes it's under 'Call controls'
-            ];
+    #         // Try 2: Find "More options" button (3 dots)
+    #         // We try multiple selectors as this changes often
+    #         const optionsSelectors = [
+    #             "button[aria-label*='More options' i]",    // Original partial match
+    #             "button[aria-label='More options']",      // Exact match
+    #             "button[data-mdc-value*='More options' i]", // data-mdc-value
+    #             "button[aria-label*='Call controls' i]"  // Sometimes it's under 'Call controls'
+    #         ];
             
-            let moreOptionsButton = null;
-            for (let selector of optionsSelectors) {
-                let btn = document.querySelector(selector);
-                if (btn && isVisible(btn)) {
-                    moreOptionsButton = btn;
-                    break;
-                }
-            }
+    #         let moreOptionsButton = null;
+    #         for (let selector of optionsSelectors) {
+    #             let btn = document.querySelector(selector);
+    #             if (btn && isVisible(btn)) {
+    #                 moreOptionsButton = btn;
+    #                 break;
+    #             }
+    #         }
 
-            // If no button found, return the error
-            if (!moreOptionsButton) return 'no_options';
+    #         // If no button found, return the error
+    #         if (!moreOptionsButton) return 'no_options';
             
-            moreOptionsButton.click();
-            await new Promise(resolve => setTimeout(resolve, 600)); // Wait for menu to open
+    #         moreOptionsButton.click();
+    #         await new Promise(resolve => setTimeout(resolve, 600)); // Wait for menu to open
 
-            // Try 3: Find "Captions" in the menu
-            // We check spans, divs, and list items
-            let captionsMenuItem = Array.from(document.querySelectorAll("div[role='menuitem'] span, div[role='menuitem'] div, li[role='menuitem']"))
-                                        .find(el => el.textContent.toLowerCase().includes('captions') && isVisible(el));
+    #         // Try 3: Find "Captions" in the menu
+    #         // We check spans, divs, and list items
+    #         let captionsMenuItem = Array.from(document.querySelectorAll("div[role='menuitem'] span, div[role='menuitem'] div, li[role='menuitem']"))
+    #                                     .find(el => el.textContent.toLowerCase().includes('captions') && isVisible(el));
             
-            if (captionsMenuItem) {
-                let clickableParent = captionsMenuItem.closest('div[role="menuitem"], li[role="menuitem"]');
-                if (clickableParent && isVisible(clickableParent)) {
-                    clickableParent.click();
-                    await new Promise(resolve => setTimeout(resolve, 300));
+    #         if (captionsMenuItem) {
+    #             let clickableParent = captionsMenuItem.closest('div[role="menuitem"], li[role="menuitem"]');
+    #             if (clickableParent && isVisible(clickableParent)) {
+    #                 clickableParent.click();
+    #                 await new Promise(resolve => setTimeout(resolve, 300));
                     
-                    // BONUS: Handle if a sub-menu opens (e.g., to select language)
-                    // We just look for "English" and click it.
-                    let languageButton = Array.from(document.querySelectorAll("div[role='menuitemradio'] span, div[role='menuitem'] span"))
-                                               .find(el => el.textContent.toLowerCase().includes('english') && isVisible(el));
-                    if (languageButton) {
-                         let langParent = languageButton.closest("[role='menuitemradio'], [role='menuitem']");
-                         if(langParent) {
-                            langParent.click();
-                            await new Promise(resolve => setTimeout(resolve, 300));
-                         }
-                    }
-                    return 'menu';
-                }
-            }
+    #                 // BONUS: Handle if a sub-menu opens (e.g., to select language)
+    #                 // We just look for "English" and click it.
+    #                 let languageButton = Array.from(document.querySelectorAll("div[role='menuitemradio'] span, div[role='menuitem'] span"))
+    #                                            .find(el => el.textContent.toLowerCase().includes('english') && isVisible(el));
+    #                 if (languageButton) {
+    #                      let langParent = languageButton.closest("[role='menuitemradio'], [role='menuitem']");
+    #                      if(langParent) {
+    #                         langParent.click();
+    #                         await new Promise(resolve => setTimeout(resolve, 300));
+    #                      }
+    #                 }
+    #                 return 'menu';
+    #             }
+    #         }
             
-            // If menu was opened but item not found, click body to close
-            if (document.body) document.body.click(); 
-            return 'not_in_menu';
-            """
-            # --- END OF MODIFIED JAVASCRIPT ---
+    #         // If menu was opened but item not found, click body to close
+    #         if (document.body) document.body.click(); 
+    #         return 'not_in_menu';
+    #         """
+    #         # --- END OF MODIFIED JAVASCRIPT ---
 
-            result = self.driver.execute_script(f"return (async () => {{ {js_enable_captions.replace('/* ... visibility check ... */', 'if (!elem) return false; return !!( elem.offsetWidth || elem.offsetHeight || elem.getClientRects().length );')} }})();")
+    #         result = self.driver.execute_script(f"return (async () => {{ {js_enable_captions.replace('/* ... visibility check ... */', 'if (!elem) return false; return !!( elem.offsetWidth || elem.offsetHeight || elem.getClientRects().length );')} }})();")
 
-            if result == 'direct': logger.info("✅ Captions turned on (Method 1: Direct JS)")
-            elif result == 'menu': logger.info("✅ Captions turned on (Method 2: More Options JS)"); time.sleep(0.5)
-            elif result == 'no_options': logger.warning("⚠️ Could not find 'More options' button (JS).")
-            elif result == 'not_in_menu': logger.warning("⚠️ Could not find 'Captions' item in menu (JS).")
-            else: logger.warning(f"⚠️ Unexpected caption script result: {result}")
-        except JavascriptException as e: logger.error(f"❌ JS error turning on captions: {e}")
-        except Exception as e: logger.error(f"❌ Error turning on captions: {e}", exc_info=True)
+    #         if result == 'direct': logger.info("✅ Captions turned on (Method 1: Direct JS)")
+    #         elif result == 'menu': logger.info("✅ Captions turned on (Method 2: More Options JS)"); time.sleep(0.5)
+    #         elif result == 'no_options': logger.warning("⚠️ Could not find 'More options' button (JS).")
+    #         elif result == 'not_in_menu': logger.warning("⚠️ Could not find 'Captions' item in menu (JS).")
+    #         else: logger.warning(f"⚠️ Unexpected caption script result: {result}")
+    #     except JavascriptException as e: logger.error(f"❌ JS error turning on captions: {e}")
+    #     except Exception as e: logger.error(f"❌ Error turning on captions: {e}", exc_info=True)
+    # --- END MODIFICATION ---
 
     def enable_microphone(self):
         """Enable microphone during call (for VB-Audio output)."""

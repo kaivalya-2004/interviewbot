@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 import queue
 import threading
+import audioop # Added for µ-law audio conversion
 # import librosa # --- REMOVED ---
 
 from app.services.meet_session_manager import MeetSessionManager
@@ -102,15 +103,17 @@ class MeetInterviewOrchestrator:
         initial_greeting = self.interview_svc.generate_initial_greeting()
         logger.info(f"🤖 Bot: {initial_greeting}")
         meet.enable_microphone(); time.sleep(0.5)
-        greeting_audio_data, _ = self.interview_svc.text_to_speech( initial_greeting, session_id, turn_count, candidate_id )
+        
+        # --- MODIFICATION: Use stream_plain_text and _play_audio_stream ---
+        greeting_audio_stream = self.interview_svc.stream_plain_text(
+            initial_greeting, session_id, turn_count, candidate_id
+        )
         turn_count += 1
         
         playback_ok = True
-        if greeting_audio_data is not None:
-            # --- MODIFICATION: Need to pass librosa resample here if TTS is not 24k ---
-            # Assuming TTS service provides self.target_samplerate (24k)
-            # If not, we need to resample the *playback* audio
-            playback_ok = self._play_audio_data(greeting_audio_data, self.target_samplerate, meet, stop_event)
+        if greeting_audio_stream:
+            playback_ok = self._play_audio_stream(greeting_audio_stream, meet, stop_event)
+        # --- END MODIFICATION ---
         
         # --- Handle drop during greeting ---
         if not playback_ok:
@@ -182,13 +185,19 @@ class MeetInterviewOrchestrator:
                     logger.error(f"❌ Participant count increased to {current_participant_count}. Terminating.")
                     if stop_event: stop_event.set()
                     session['termination_reason'] = "multiple_participants"
-                    termination_msg = ("<speak>It appears there are extra participants in the call. <break time='1000ms'/> "
-                                       "For interview integrity, <break time='700ms'/> we must end the session now. <break time='1000ms'/> "
-                                       "Thank you.</speak>")
+                    
+                    # --- MODIFICATION: Changed to plain text ---
+                    termination_msg = ("It appears there are extra participants in the call. "
+                                       "For interview integrity, we must end the session now. "
+                                       "Thank you.")
                     logger.info(f"🤖 Bot: {termination_msg}")
                     meet.enable_microphone(); time.sleep(0.5)
-                    term_audio_data, _ = self.interview_svc.text_to_speech( termination_msg, session_id, turn_count, candidate_id )
-                    if term_audio_data is not None: self._play_audio_data(term_audio_data, self.target_samplerate, meet, stop_event)
+                    # --- MODIFICATION: Use stream_plain_text ---
+                    term_audio_stream = self.interview_svc.stream_plain_text(
+                         termination_msg, session_id, turn_count, candidate_id 
+                    )
+                    if term_audio_stream: self._play_audio_stream(term_audio_stream, meet, stop_event)
+                    # --- END MODIFICATION ---
                     time.sleep(0.5); meet.disable_microphone()
                     break
 
@@ -217,21 +226,27 @@ class MeetInterviewOrchestrator:
             if stop_event and stop_event.is_set(): logger.info("Stop signal after STT wait."); break
 
             logger.info(f"\n--- Generating Question {questions_asked_count + 1}/{max_questions} ---")
-            current_question = self.interview_svc.generate_next_question(session_id)
-            if "Error:" in current_question: logger.error(f"Gemini error: {current_question}. Ending."); break
-            questions_asked_count += 1
 
-            logger.info(f"🤖 Bot: {current_question}"); transcript.append({"role": "assistant", "content": current_question})
-
-            # Ask question
+            # --- MODIFICATION: Replace text_to_speech and _play_audio_data ---
             meet.enable_microphone(); time.sleep(0.5)
-            question_audio_data, _ = self.interview_svc.text_to_speech( current_question, session_id, turn_count, candidate_id )
+            
+            # This generator handles Gemini text, TTS, and yields audio bytes
+            audio_stream_generator = self.interview_svc.stream_interview_turn(
+                session_id, turn_count, candidate_id
+            )
+            # We increment turn_count now, and the service will log the text at the end
+            current_turn = turn_count # Use this for STT logging
             turn_count += 1
+            questions_asked_count += 1
             
             playback_ok = True # Reset for this turn
-            if question_audio_data is not None:
-                playback_ok = self._play_audio_data(question_audio_data, self.target_samplerate, meet, stop_event)
-            
+            if audio_stream_generator:
+                playback_ok = self._play_audio_stream(audio_stream_generator, meet, stop_event)
+            else:
+                logger.error("Failed to create audio stream generator.")
+                playback_ok = False
+            # --- END MODIFICATION ---
+
             # --- Handle drop during question playback ---
             if not playback_ok:
                  logger.warning("Playback stopped early (candidate left or terminated).")
@@ -251,9 +266,9 @@ class MeetInterviewOrchestrator:
                     if stop_event: stop_event.set(); session['termination_reason'] = "candidate_left";
                     break # Exit main interview loop
                  else:
-                    # Candidate rejoined, restart the loop to re-ask the same question
+                    # Candidate rejoined, just continue to the next loop iteration
+                    # The bot will generate a new question
                     questions_asked_count -= 1 # Decrement since question wasn't answered
-                    transcript.pop() # Remove the question we just added to the local transcript
                     turn_count -= 1 # Decrement turn count for TTS filename
                     playback_ok = True # Reset flag
                     continue # Restart main while loop
@@ -262,7 +277,9 @@ class MeetInterviewOrchestrator:
 
             # Record response & start background processing
             logger.info("🎤 Listening..."); active_stt_thread, rec_start_time = self._record_and_process_stt_background( session_id, turn_count, candidate_id, duration=60, is_follow_up_response=False )
-            current_turn = turn_count; turn_count += 1
+            # We update current_turn here for the *next* loop's STT wait
+            current_turn = turn_count 
+            turn_count += 1
             logger.info("Disabling mic..."); meet.disable_microphone(); logger.info("Mic disabled.")
             if stop_event and stop_event.is_set(): logger.info("Stop signal after starting STT."); break
             transcript.append({"role": "user", "content": "[Processing Response...]", "turn": current_turn})
@@ -296,12 +313,20 @@ class MeetInterviewOrchestrator:
         if termination_reason == "multiple_participants": logger.info("Skipping generic closing (multi-participant).")
         elif termination_reason == "candidate_left": logger.info("Skipping closing statement (candidate left).")
         else:
-             closing_text = (f"<speak>Thank you for your time. <break time='1000ms'/> {closing_reason} "
-                             f"<break time='1000ms'/> That concludes our interview today.</speak>")
+             # --- MODIFICATION: Changed to plain text ---
+             closing_text = (f"Thank you for your time. {closing_reason} "
+                             f"That concludes our interview today.")
              logger.info(f"🤖 Bot: {closing_text}")
              meet.enable_microphone(); time.sleep(0.5)
-             closing_audio_data, _ = self.interview_svc.text_to_speech( closing_text, session_id, turn_count, candidate_id )
-             if closing_audio_data is not None: self._play_audio_data(closing_audio_data, self.target_samplerate, meet, stop_event) # Pass args
+             
+             # --- MODIFICATION: Use stream_plain_text ---
+             closing_audio_stream = self.interview_svc.stream_plain_text(
+                 closing_text, session_id, turn_count, candidate_id
+             )
+             if closing_audio_stream:
+                 self._play_audio_stream(closing_audio_stream, meet, stop_event)
+             # --- END MODIFICATION ---
+             
              time.sleep(0.5); meet.disable_microphone()
 
 
@@ -319,86 +344,125 @@ class MeetInterviewOrchestrator:
 
         return { "status": final_status, "session_id": session_id, "questions_asked": questions_asked_count, "final_transcript_summary": transcript }
 
-    def _play_audio_data(self, audio_data: np.ndarray, sample_rate: int, meet: MeetController, stop_event: threading.Event) -> bool:
-        """Play audio data using non-blocking stream, monitoring for drops/stop."""
+    def _play_audio_stream(self, audio_chunk_iterator: iter, meet: MeetController, stop_event: threading.Event) -> bool:
+        """
+        Play audio from a generator that yields audio_bytes chunks.
+        This uses a queue to decouple audio generation from playback.
+        """
         
-        # --- MODIFICATION: Need to ensure playback is at target_samplerate ---
-        # We need librosa for this one part.
-        try:
-            import librosa
-        except ImportError:
-            logger.error("Librosa not installed. Cannot resample playback audio!")
-            # Fallback: Try to play as-is, which might fail or be wrong speed
-            pass
+        audio_queue = queue.Queue(maxsize=100) # Buffer approx 100 chunks
+        stream_finished_event = threading.Event() # For the audio stream
+        generator_finished_event = threading.Event() # For the feeder thread
+        
+        def feeder_thread_func():
+            """Pulls from Gemini/TTS iterator and puts np arrays into queue."""
+            try:
+                for audio_chunk_bytes in audio_chunk_iterator:
+                    if stop_event.is_set() or stream_finished_event.is_set():
+                        break
+                    
+                    # Decode MULAW to LINEAR16 first
+                    linear_audio = audioop.ulaw2lin(audio_chunk_bytes, 2)
+                    
+                    # Convert 16-bit PCM bytes to float32 numpy array
+                    audio_data = np.frombuffer(linear_audio, dtype=np.int16).astype(np.float32) / 32768.0
+                    
+                    if len(audio_data) > 0:
+                        audio_queue.put(audio_data)
+                        
+            except Exception as e:
+                logger.error(f"Audio feeder thread error: {e}", exc_info=True)
+            finally:
+                audio_queue.put(None) # Sentinel to signal end
+                generator_finished_event.set()
 
-        try:
-            data_float = audio_data.astype(np.float32)
-            if audio_data.dtype == np.int16:
-                data_float /= 32768.0
+        # This buffer is inside the callback to handle chunk mismatches
+        internal_buffer = np.array([], dtype=np.float32)
+        
+        def playback_callback(outdata: np.ndarray, frames: int, time_info, status):
+            nonlocal internal_buffer
+            if status: logger.warning(f"Playback status: {status}")
             
-            if sample_rate != self.target_samplerate:
-                logger.warning(f"⚠️ Playback SR mismatch! Expected {self.target_samplerate}, got {sample_rate}. Resampling...")
+            buffer_len = len(internal_buffer)
+            
+            # Check if we have enough data in our buffer
+            if buffer_len >= frames:
+                outdata[:] = internal_buffer[:frames].reshape(-1, 1)
+                internal_buffer = internal_buffer[frames:]
+                return
+            
+            # Not enough data, try to fill buffer from queue
+            while buffer_len < frames:
                 try:
-                    data_float = librosa.resample(data_float, orig_sr=sample_rate, target_sr=self.target_samplerate)
-                except Exception as resample_e:
-                    logger.error(f"On-the-fly resampling failed: {resample_e}. Playing as-is.")
-                    # Cannot proceed if samplerates don't match and resample fails
-                    return False # Or play as-is and hope
-            
-            logger.info(f"📥 Playing audio data: {self.target_samplerate}Hz, {len(data_float)} samples")
-            
-            if len(data_float.shape) > 1: data_float = np.mean(data_float, axis=1)
-            max_val = np.abs(data_float).max();
-            if max_val > 0: data_float = data_float / max_val * 0.9
-            
-            silence_duration = 0.7; silence_samples = int(silence_duration * self.target_samplerate); silence = np.zeros(silence_samples, dtype=np.float32)
-            data_to_play = np.concatenate([silence, data_float, silence])
+                    # Get data from feeder thread
+                    chunk = audio_queue.get_nowait()
+                    
+                    if chunk is None:
+                        # End of stream. Pad with silence.
+                        outdata[:buffer_len] = internal_buffer.reshape(-1, 1)
+                        outdata[buffer_len:] = 0 # Pad remaining frame with silence
+                        internal_buffer = np.array([], dtype=np.float32)
+                        raise sd.CallbackStop # Stop the stream
+                    
+                    # Add new chunk to buffer
+                    internal_buffer = np.concatenate([internal_buffer, chunk])
+                    buffer_len = len(internal_buffer)
+                
+                except queue.Empty:
+                    # Queue is empty, but stream not finished.
+                    # Play what we have, then silence for this frame.
+                    outdata[:buffer_len] = internal_buffer.reshape(-1, 1)
+                    outdata[buffer_len:] = 0
+                    internal_buffer = np.array([], dtype=np.float32)
+                    return # Wait for next callback
+
+            # We've filled the buffer, play from it
+            outdata[:] = internal_buffer[:frames].reshape(-1, 1)
+            internal_buffer = internal_buffer[frames:]
+
+        # --- Start Execution ---
+        try:
+            feeder_thread = threading.Thread(target=feeder_thread_func, daemon=True, name="AudioFeeder")
+            feeder_thread.start()
             
             output_device = self.virtual_output if self.virtual_output is not None else sd.default.device[1]
-            duration = len(data_to_play) / self.target_samplerate
-            logger.info(f"🔊 Playing to device {output_device} ({self.target_samplerate}Hz, {duration:.2f}s)")
+            logger.info(f"🔊 Playing audio stream to device {output_device}...")
 
-            stream_finished_event = threading.Event()
-            current_sample = 0
-            
-            def playback_callback(outdata: np.ndarray, frames: int, time_info, status):
-                nonlocal current_sample
-                if status: logger.warning(f"Playback status: {status}")
-                chunk_len = len(data_to_play) - current_sample
-                if frames >= chunk_len:
-                    outdata[:chunk_len] = data_to_play[current_sample:].reshape(-1, 1)
-                    outdata[chunk_len:] = 0
-                    current_sample += chunk_len
-                    raise sd.CallbackStop
-                else:
-                    chunk_end = current_sample + frames
-                    outdata[:] = data_to_play[current_sample:chunk_end].reshape(-1, 1)
-                    current_sample += frames
-
-            stream = sd.OutputStream( samplerate=self.target_samplerate, device=output_device, channels=1, dtype='float32', callback=playback_callback, finished_callback=stream_finished_event.set )
+            stream = sd.OutputStream(
+                samplerate=self.target_samplerate, # 24000 Hz
+                device=output_device,
+                channels=1,
+                dtype='float32',
+                callback=playback_callback,
+                finished_callback=stream_finished_event.set
+            )
 
             with stream:
-                check_interval = 1.0
+                check_interval = 0.5
                 while not stream_finished_event.is_set():
                     if stream_finished_event.wait(timeout=check_interval):
-                         break # Stream finished
+                        break # Stream finished
+                    
                     if stop_event.is_set():
                         logger.warning("Playback interrupted by external stop signal.")
                         stream.stop()
                         return False
+                        
                     try:
                         count = meet.get_participant_count()
                         if count < 2:
                             logger.error("❌ Candidate left during audio playback! Stopping playback.")
                             stream.stop()
                             return False
-                    except Exception as e: logger.error(f"Error checking participant count during playback: {e}")
+                    except Exception as e:
+                        logger.error(f"Error checking participant count during playback: {e}")
             
-            logger.info("✅ Playback complete (monitored)")
-            time.sleep(0.5)
+            logger.info("✅ Playback stream finished.")
+            feeder_thread.join(timeout=2) # Wait for feeder to finish
             return True
+
         except Exception as e:
-            logger.error(f"❌ Failed to play audio data: {e}", exc_info=True)
+            logger.error(f"❌ Failed to play audio stream: {e}", exc_info=True)
             return False
 
     # --- START MODIFICATION: Renamed and simplified ---

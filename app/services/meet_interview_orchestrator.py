@@ -20,8 +20,8 @@ from app.services.meet_controller import MeetController # Import MeetController 
 
 logger = logging.getLogger(__name__)
 
-# Estimated buffer time for one full Q&A turn
 ESTIMATED_TURN_DURATION_SECONDS = 90
+# --- Tab monitoring constants REMOVED ---
 
 class MeetInterviewOrchestrator:
     """
@@ -65,6 +65,8 @@ class MeetInterviewOrchestrator:
             self.virtual_output = None
             self.virtual_input = None
 
+    # --- _monitor_tab_switching method REMOVED ---
+
     async def conduct_interview(
         self,
         session_id: str,
@@ -88,264 +90,284 @@ class MeetInterviewOrchestrator:
              logger.error("Controller or candidate_id missing."); return {"error": "Internal session error", "status": "failed"}
         
         session['termination_reason'] = None
-
-        logger.info("Proceeding with interview start.")
-        await asyncio.sleep(1) 
-
-        start_time = time.time()
+        
+        # --- monitor_task REMOVED ---
+        start_time = time.time() 
         transcript = [] 
-        turn_count = 1 
         questions_asked_count = 0 
+        
+        try: 
+            # --- monitor_task creation REMOVED ---
 
-        # --- Ask Initial Greeting & Handle Intro ---
-        initial_greeting = self.interview_svc.generate_initial_greeting()
-        logger.info(f"🤖 Bot: {initial_greeting}")
-        
-        await asyncio.to_thread(meet.enable_microphone); await asyncio.sleep(0.5)
-        
-        greeting_audio_stream = self.interview_svc.stream_plain_text(
-            initial_greeting, session_id, turn_count, candidate_id
-        )
-        turn_count += 1
-        
-        playback_ok = True
-        if greeting_audio_stream:
-            playback_ok = await asyncio.to_thread(
-                self._play_audio_stream, greeting_audio_stream, meet, stop_event
-            )
-        
-        # --- Handle drop during greeting ---
-        if not playback_ok:
-            logger.warning("Playback stopped early during greeting (candidate left or terminated).")
-            logger.warning(f"⚠️ Candidate drop during greeting. Waiting 2 minutes to rejoin...")
-            rejoin_wait_start = time.time(); rejoin_timeout = 120; rejoined = False
-            while time.time() - rejoin_wait_start < rejoin_timeout:
-                if stop_event and stop_event.is_set(): logger.info("Terminated manually during rejoin wait."); break
-                rejoin_count = await asyncio.to_thread(meet.get_participant_count)
-                if rejoin_count >= 2: logger.info(f"✅ Candidate rejoined! (Count: {rejoin_count}). Resuming."); rejoined = True; break
-                logger.debug(f"Waiting rejoin... ({int(time.time() - rejoin_wait_start)}s / {rejoin_timeout}s)"); await asyncio.sleep(5)
+            # --- Video ratio pre-check REMOVED ---
+
+            logger.info("Proceeding with interview start.")
+            await asyncio.sleep(1) 
+
+            turn_count = 1 
+
+            # --- Ask Initial Greeting & Handle Intro ---
+            initial_greeting = self.interview_svc.generate_initial_greeting()
+            logger.info(f"🤖 Bot: {initial_greeting}")
             
-            if not rejoined: 
-                if stop_event and stop_event.is_set(): logger.info("Manually terminated during rejoin wait.")
-                else: logger.error(f"❌ Candidate did not rejoin. Terminating.");
-                if stop_event: stop_event.set(); session['termination_reason'] = "candidate_left";
-            else:
-                playback_ok = True 
-        
-        await asyncio.sleep(0.5)
-
-        intro_text = "[Recording skipped due to early exit]"
-        if playback_ok and not (stop_event and stop_event.is_set()): 
-            logger.info("🎤 Listening for candidate's introduction...")
-            
-            rec_start_time = await asyncio.to_thread(
-                self._record_and_process_stt_streaming_manual_vad, # <--- CALL NEW FUNCTION
-                session_id, turn_count, candidate_id, 
-                is_follow_up_response=False
-            )
-
-            intro_turn = turn_count
-            turn_count += 1
-            logger.info("Disabling mic after intro..."); 
-            await asyncio.to_thread(meet.disable_microphone); logger.info("Mic disabled.")
-        
-        if stop_event and stop_event.is_set():
-             logger.info("Stop signal detected after intro recording. Ending early.")
-             try: self.interview_svc.generate_final_transcript_file(session_id)
-             except Exception as e: logger.error(f"Failed to generate final transcript after early exit: {e}")
-             return {"status": "terminated", "session_id": session_id, "final_transcript_summary": transcript}
-
-        await asyncio.sleep(0.1) # Give a moment for the log to process
-        with self.interview_svc._transcript_lock:
-                intro_text = self.interview_svc._latest_transcript_for_gemini.get(session_id, "[Transcript not updated after intro]")
-
-        if intro_text and not intro_text.startswith("[Error") and intro_text != "[Unintelligible]" and intro_text != "[No response]" and intro_text != "[Recording cancelled]" and intro_text != "[Transcript not updated after intro]":
-            logger.info(f"👤 Candidate Intro: {intro_text}")
-            transcript.append({"role": "user", "content": intro_text, "is_follow_up": False})
-        else:
-             logger.warning(f"Could not cleanly capture intro: {intro_text}")
-             transcript.append({"role": "user", "content": intro_text or "[Introduction Unclear]", "is_follow_up": False})
-
-
-        # --- Main Interview Loop (Prioritizes Time) ---
-        while playback_ok: 
-            elapsed_time = time.time() - start_time
-            remaining_time = interview_duration_seconds - elapsed_time
-
-            # Primary Termination Checks
-            if stop_event and stop_event.is_set(): logger.info("Termination signal received."); break
-            if questions_asked_count >= max_questions: logger.info(f"Max questions ({max_questions}) reached."); break
-            if remaining_time < ESTIMATED_TURN_DURATION_SECONDS and questions_asked_count > 0:
-                logger.info(f"Time limit approaching ({remaining_time:.0f}s left)."); break
-
-            # Participant Count Check
-            try:
-                current_participant_count = await asyncio.to_thread(meet.get_participant_count)
-                
-                if current_participant_count > 2:
-                    logger.error(f"❌ Participant count increased to {current_participant_count}. Terminating.")
-                    if stop_event: stop_event.set()
-                    session['termination_reason'] = "multiple_participants"
-                    
-                    termination_msg = ("It appears there are extra participants in the call. "
-                                       "For interview integrity, we must end the session now. "
-                                       "Thank you.")
-                    logger.info(f"🤖 Bot: {termination_msg}")
-                    await asyncio.to_thread(meet.enable_microphone); await asyncio.sleep(0.5)
-                    term_audio_stream = self.interview_svc.stream_plain_text(
-                         termination_msg, session_id, turn_count, candidate_id 
-                    )
-                    if term_audio_stream: 
-                        await asyncio.to_thread(
-                            self._play_audio_stream, term_audio_stream, meet, stop_event
-                        )
-                    await asyncio.sleep(0.5); await asyncio.to_thread(meet.disable_microphone)
-                    break
-
-                elif current_participant_count < 2:
-                    logger.warning(f"⚠️ Participant count dropped to {current_participant_count}. Waiting 2 minutes to rejoin...")
-                    rejoin_wait_start = time.time(); rejoin_timeout = 120; rejoined = False
-                    while time.time() - rejoin_wait_start < rejoin_timeout:
-                        if stop_event and stop_event.is_set(): logger.info("Terminated manually during rejoin wait."); break
-                        rejoin_count = await asyncio.to_thread(meet.get_participant_count)
-                        if rejoin_count >= 2: logger.info(f"✅ Candidate rejoined! (Count: {rejoin_count}). Resuming."); rejoined = True; break
-                        logger.debug(f"Waiting rejoin... ({int(time.time() - rejoin_wait_start)}s / {rejoin_timeout}s)"); await asyncio.sleep(5)
-                    if not rejoined:
-                        if stop_event and stop_event.is_set(): logger.info("Manually terminated during rejoin wait."); break
-                        else: logger.error(f"❌ Candidate did not rejoin. Terminating.");
-                        if stop_event: stop_event.set(); session['termination_reason'] = "candidate_left"; break
-            except Exception as check_e: logger.error(f"Error during participant check: {check_e}")
-
-            logger.info(f"Time elapsed: {elapsed_time:.0f}s / {interview_duration_seconds}s (Rem: {remaining_time:.0f}s)")
-            
-            if stop_event and stop_event.is_set(): logger.info("Stop signal after STT wait."); break
-
-            logger.info(f"\n--- Generating Question {questions_asked_count + 1}/{max_questions} ---")
-
             await asyncio.to_thread(meet.enable_microphone); await asyncio.sleep(0.5)
             
-            audio_stream_generator = self.interview_svc.stream_interview_turn(
-                session_id, turn_count, candidate_id
+            greeting_audio_stream = self.interview_svc.stream_plain_text(
+                initial_greeting, session_id, turn_count, candidate_id
             )
-            current_turn = turn_count 
             turn_count += 1
-            questions_asked_count += 1
             
-            playback_ok = True 
-            if audio_stream_generator:
+            playback_ok = True
+            if greeting_audio_stream:
                 playback_ok = await asyncio.to_thread(
-                    self._play_audio_stream, audio_stream_generator, meet, stop_event
+                    self._play_audio_stream, greeting_audio_stream, meet, stop_event
                 )
-            else:
-                logger.error("Failed to create audio stream generator.")
-                playback_ok = False
-
-            # --- Handle drop during question playback ---
+            
+            # --- Handle drop during greeting ---
             if not playback_ok:
-                 logger.warning("Playback stopped early (candidate left or terminated).")
-                 logger.warning(f"⚠️ Candidate drop during question. Waiting 2 minutes to rejoin...")
-                 rejoin_wait_start = time.time(); rejoin_timeout = 120; rejoined = False
-                 while time.time() - rejoin_wait_start < rejoin_timeout:
-                     if stop_event and stop_event.is_set(): logger.info("Terminated manually during rejoin wait."); break
-                     rejoin_count = await asyncio.to_thread(meet.get_participant_count)
-                     if rejoin_count >= 2: logger.info(f"✅ Candidate rejoined! (Count: {rejoin_count}). Re-asking question."); rejoined = True; break
-                     logger.debug(f"Waiting rejoin... ({int(time.time() - rejoin_wait_start)}s / {rejoin_timeout}s)"); await asyncio.sleep(5)
-
-                 if not rejoined: 
+                logger.warning("Playback stopped early during greeting (candidate left or terminated).")
+                logger.warning(f"⚠️ Candidate drop during greeting. Waiting 2 minutes to rejoin...")
+                rejoin_wait_start = time.time(); rejoin_timeout = 120; rejoined = False
+                while time.time() - rejoin_wait_start < rejoin_timeout:
+                    if stop_event and stop_event.is_set(): logger.info("Terminated manually during rejoin wait."); break
+                    rejoin_count = await asyncio.to_thread(meet.get_participant_count)
+                    if rejoin_count >= 2: logger.info(f"✅ Candidate rejoined! (Count: {rejoin_count}). Resuming."); rejoined = True; break
+                    logger.debug(f"Waiting rejoin... ({int(time.time() - rejoin_wait_start)}s / {rejoin_timeout}s)"); await asyncio.sleep(5)
+                
+                if not rejoined: 
                     if stop_event and stop_event.is_set(): logger.info("Manually terminated during rejoin wait.")
                     else: logger.error(f"❌ Candidate did not rejoin. Terminating.");
                     if stop_event: stop_event.set(); session['termination_reason'] = "candidate_left";
-                    break 
-                 else:
-                    questions_asked_count -= 1 
-                    turn_count -= 1 
+                else:
                     playback_ok = True 
-                    continue 
             
             await asyncio.sleep(0.5)
 
-            # Record response & start background processing
-            logger.info("🎤 Listening..."); 
+            intro_text = "[Recording skipped due to early exit]"
+            if playback_ok and not (stop_event and stop_event.is_set()): 
+                logger.info("🎤 Listening for candidate's introduction...")
+                
+                rec_start_time = await asyncio.to_thread(
+                    self._record_and_process_stt_streaming_manual_vad, 
+                    session_id, turn_count, candidate_id, 
+                    is_follow_up_response=False
+                )
+
+                intro_turn = turn_count
+                turn_count += 1
+                logger.info("Disabling mic after intro..."); 
+                await asyncio.to_thread(meet.disable_microphone); logger.info("Mic disabled.")
             
-            rec_start_time = await asyncio.to_thread(
-                self._record_and_process_stt_streaming_manual_vad, # <--- CALL NEW FUNCTION
-                session_id, turn_count, candidate_id,
-                is_follow_up_response=False
-            )
+            if stop_event and stop_event.is_set():
+                 logger.info("Stop signal detected after intro recording. Ending early.")
+                 try: self.interview_svc.generate_final_transcript_file(session_id)
+                 except Exception as e: logger.error(f"Failed to generate final transcript after early exit: {e}")
+                 return {"status": "terminated", "session_id": session_id, "final_transcript_summary": transcript}
 
-            current_turn = turn_count 
-            turn_count += 1
-            logger.info("Disabling mic..."); 
-            await asyncio.to_thread(meet.disable_microphone); logger.info("Mic disabled.")
-            if stop_event and stop_event.is_set(): logger.info("Stop signal after starting STT."); break
-            transcript.append({"role": "user", "content": "[Processing Response...]", "turn": current_turn})
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.1) 
+            with self.interview_svc._transcript_lock:
+                    intro_text = self.interview_svc._latest_transcript_for_gemini.get(session_id, "[Transcript not updated after intro]")
 
-        # --- End of Loop ---
-        logger.info("Interview loop finished.")
+            if intro_text and not intro_text.startswith("[Error") and intro_text != "[Unintelligible]" and intro_text != "[No response]" and intro_text != "[Recording cancelled]" and intro_text != "[Transcript not updated after intro]":
+                logger.info(f"👤 Candidate Intro: {intro_text}")
+                transcript.append({"role": "user", "content": intro_text, "is_follow_up": False})
+            else:
+                 logger.warning(f"Could not cleanly capture intro: {intro_text}")
+                 transcript.append({"role": "user", "content": intro_text or "[Introduction Unclear]", "is_follow_up": False})
 
-        logger.info("Final STT work already completed in loop.")
 
-        # Closing statement
-        closing_reason = "Allocated time is up."; termination_reason = session.get('termination_reason', None)
-        final_elapsed = time.time() - start_time 
-        try: 
-            last_participant_count = await asyncio.to_thread(meet.get_participant_count)
-        except: last_participant_count = 2 
+            # --- Main Interview Loop (Prioritizes Time) ---
+            while playback_ok: 
+                elapsed_time = time.time() - start_time
+                remaining_time = interview_duration_seconds - elapsed_time
+
+                # Primary Termination Checks
+                if stop_event and stop_event.is_set(): logger.info("Termination signal received."); break
+                if questions_asked_count >= max_questions: logger.info(f"Max questions ({max_questions}) reached."); break
+                if remaining_time < ESTIMATED_TURN_DURATION_SECONDS and questions_asked_count > 0:
+                    logger.info(f"Time limit approaching ({remaining_time:.0f}s left)."); break
+
+                # Participant Count Check
+                try:
+                    current_participant_count = await asyncio.to_thread(meet.get_participant_count)
+                    
+                    if current_participant_count > 2:
+                        logger.error(f"❌ Participant count increased to {current_participant_count}. Terminating.")
+                        if stop_event: stop_event.set()
+                        session['termination_reason'] = "multiple_participants"
+                        
+                        termination_msg = ("It appears there are extra participants in the call. "
+                                           "For interview integrity, we must end the session now. "
+                                           "Thank you.")
+                        logger.info(f"🤖 Bot: {termination_msg}")
+                        await asyncio.to_thread(meet.enable_microphone); await asyncio.sleep(0.5)
+                        term_audio_stream = self.interview_svc.stream_plain_text(
+                             termination_msg, session_id, turn_count, candidate_id 
+                        )
+                        if term_audio_stream: 
+                            await asyncio.to_thread(
+                                self._play_audio_stream, term_audio_stream, meet, stop_event
+                            )
+                        await asyncio.sleep(0.5); await asyncio.to_thread(meet.disable_microphone)
+                        break
+
+                    elif current_participant_count < 2:
+                        logger.warning(f"⚠️ Participant count dropped to {current_participant_count}. Waiting 2 minutes to rejoin...")
+                        rejoin_wait_start = time.time(); rejoin_timeout = 120; rejoined = False
+                        while time.time() - rejoin_wait_start < rejoin_timeout:
+                            if stop_event and stop_event.is_set(): logger.info("Terminated manually during rejoin wait."); break
+                            rejoin_count = await asyncio.to_thread(meet.get_participant_count)
+                            if rejoin_count >= 2: logger.info(f"✅ Candidate rejoined! (Count: {rejoin_count}). Resuming."); rejoined = True; break
+                            logger.debug(f"Waiting rejoin... ({int(time.time() - rejoin_wait_start)}s / {rejoin_timeout}s)"); await asyncio.sleep(5)
+                        if not rejoined:
+                            if stop_event and stop_event.is_set(): logger.info("Manually terminated during rejoin wait."); break
+                            else: logger.error(f"❌ Candidate did not rejoin. Terminating.");
+                            if stop_event: stop_event.set(); session['termination_reason'] = "candidate_left"; break
+                except Exception as check_e: logger.error(f"Error during participant check: {check_e}")
+
+                logger.info(f"Time elapsed: {elapsed_time:.0f}s / {interview_duration_seconds}s (Rem: {remaining_time:.0f}s)")
+                
+                if stop_event and stop_event.is_set(): logger.info("Stop signal after STT wait."); break
+
+                logger.info(f"\n--- Generating Question {questions_asked_count + 1}/{max_questions} ---")
+
+                await asyncio.to_thread(meet.enable_microphone); await asyncio.sleep(0.5)
+                
+                audio_stream_generator = self.interview_svc.stream_interview_turn(
+                    session_id, turn_count, candidate_id
+                )
+                current_turn = turn_count 
+                turn_count += 1
+                questions_asked_count += 1
+                
+                playback_ok = True 
+                if audio_stream_generator:
+                    playback_ok = await asyncio.to_thread(
+                        self._play_audio_stream, audio_stream_generator, meet, stop_event
+                    )
+                else:
+                    logger.error("Failed to create audio stream generator.")
+                    playback_ok = False
+
+                # --- Handle drop during question playback ---
+                if not playback_ok:
+                     logger.warning("Playback stopped early (candidate left or terminated).")
+                     logger.warning(f"⚠️ Candidate drop during question. Waiting 2 minutes to rejoin...")
+                     rejoin_wait_start = time.time(); rejoin_timeout = 120; rejoined = False
+                     while time.time() - rejoin_wait_start < rejoin_timeout:
+                         if stop_event and stop_event.is_set(): logger.info("Terminated manually during rejoin wait."); break
+                         rejoin_count = await asyncio.to_thread(meet.get_participant_count)
+                         if rejoin_count >= 2: logger.info(f"✅ Candidate rejoined! (Count: {rejoin_count}). Re-asking question."); rejoined = True; break
+                         logger.debug(f"Waiting rejoin... ({int(time.time() - rejoin_wait_start)}s / {rejoin_timeout}s)"); await asyncio.sleep(5)
+
+                     if not rejoined: 
+                        if stop_event and stop_event.is_set(): logger.info("Manually terminated during rejoin wait.")
+                        else: logger.error(f"❌ Candidate did not rejoin. Terminating.");
+                        if stop_event: stop_event.set(); session['termination_reason'] = "candidate_left";
+                        break 
+                     else:
+                        questions_asked_count -= 1 
+                        turn_count -= 1 
+                        playback_ok = True 
+                        continue 
+                
+                await asyncio.sleep(0.5)
+
+                # Record response & start background processing
+                logger.info("🎤 Listening..."); 
+                
+                rec_start_time = await asyncio.to_thread(
+                    self._record_and_process_stt_streaming_manual_vad, 
+                    session_id, turn_count, candidate_id,
+                    is_follow_up_response=False
+                )
+
+                current_turn = turn_count 
+                turn_count += 1
+                logger.info("Disabling mic..."); 
+                await asyncio.to_thread(meet.disable_microphone); logger.info("Mic disabled.")
+                if stop_event and stop_event.is_set(): logger.info("Stop signal after starting STT."); break
+                transcript.append({"role": "user", "content": "[Processing Response...]", "turn": current_turn})
+                await asyncio.sleep(0.5)
+
+            # --- End of Loop ---
+            logger.info("Interview loop finished.")
+            
+        except Exception as e:
+            logger.error(f"❌ FATAL ERROR in conduct_interview: {e}", exc_info=True)
+            if stop_event: stop_event.set() # Ensure cleanup
         
-        if stop_event and stop_event.is_set():
-             if termination_reason == "multiple_participants": closing_reason = "Multiple participants were detected."
-             elif termination_reason == "candidate_left": closing_reason = "The candidate left the meeting."
-             else: closing_reason = "The interview was ended early."
-        elif questions_asked_count >= max_questions: closing_reason = "We have reached the question limit."
-        elif 'remaining_time' in locals() and not (remaining_time < ESTIMATED_TURN_DURATION_SECONDS or final_elapsed >= interview_duration_seconds):
-             closing_reason = "We have completed the interview."
+        finally:
+            # --- monitor_task cleanup REMOVED ---
 
-        if termination_reason == "multiple_participants": logger.info("Skipping generic closing (multi-participant).")
-        elif termination_reason == "candidate_left": logger.info("Skipping closing statement (candidate left).")
-        else:
-             closing_text = (f"Thank you for your time. {closing_reason} "
-                             f"That concludes our interview today.")
-             logger.info(f"🤖 Bot: {closing_text}")
-             await asyncio.to_thread(meet.enable_microphone); await asyncio.sleep(0.5)
-             
-             closing_audio_stream = self.interview_svc.stream_plain_text(
-                 closing_text, session_id, turn_count, candidate_id
-             )
-             if closing_audio_stream:
-                 await asyncio.to_thread(
-                     self._play_audio_stream, closing_audio_stream, meet, stop_event
+            logger.info("Final STT work already completed in loop.")
+
+            # Closing statement
+            closing_reason = "Allocated time is up."; termination_reason = session.get('termination_reason', None)
+            final_elapsed = time.time() - start_time 
+            
+            try: 
+                last_participant_count = await asyncio.to_thread(meet.get_participant_count)
+            except: last_participant_count = 2 
+            
+            if stop_event and stop_event.is_set():
+                 if termination_reason == "multiple_participants": closing_reason = "Multiple participants were detected."
+                 elif termination_reason == "candidate_left": closing_reason = "The candidate left the meeting."
+                 else: closing_reason = "The interview was ended early."
+            elif questions_asked_count >= max_questions: closing_reason = "We have reached the end of the interview."
+            elif 'remaining_time' in locals() and not (remaining_time < ESTIMATED_TURN_DURATION_SECONDS or final_elapsed >= interview_duration_seconds):
+                 closing_reason = "We have completed the interview."
+            elif final_elapsed >= interview_duration_seconds:
+                 closing_reason = "Allocated time is up."
+            elif questions_asked_count == 0 and not termination_reason:
+                closing_reason = "Interview did not start."
+
+            if termination_reason in ["multiple_participants", "candidate_left"]:
+                 logger.info(f"Skipping generic closing statement (Reason: {termination_reason}).")
+            else:
+                 closing_text = (f"Thank you for your time. {closing_reason} "
+                                 f"That concludes our interview today.")
+                 logger.info(f"🤖 Bot: {closing_text}")
+                 await asyncio.to_thread(meet.enable_microphone); await asyncio.sleep(0.5)
+                 
+                 closing_audio_stream = self.interview_svc.stream_plain_text(
+                     closing_text, session_id, turn_count, candidate_id
                  )
-             
-             await asyncio.sleep(0.5); await asyncio.to_thread(meet.disable_microphone)
+                 if closing_audio_stream:
+                     await asyncio.to_thread(
+                         self._play_audio_stream, closing_audio_stream, meet, stop_event
+                     )
+                 
+                 await asyncio.sleep(0.5); await asyncio.to_thread(meet.disable_microphone)
 
+            # --- Tab switch DB save REMOVED ---
 
-        try: self.interview_svc.generate_final_transcript_file(session_id)
-        except Exception as e: logger.error(f"Failed generate final transcript: {e}")
+            try: self.interview_svc.generate_final_transcript_file(session_id)
+            except Exception as e: logger.error(f"Failed generate final transcript: {e}")
 
-        logger.info("✅ Interview orchestration function finished.")
+            logger.info("✅ Interview orchestration function finished.")
 
         final_status = "unknown"
-        if stop_event and stop_event.is_set(): final_status = "terminated"
-        elif 'remaining_time' in locals() and remaining_time < ESTIMATED_TURN_DURATION_SECONDS: final_status = "time_limit_reached"
-        elif final_elapsed >= interview_duration_seconds : final_status = "time_limit_reached"
-        elif questions_asked_count >= max_questions: final_status = "max_questions_reached"
-        else: final_status = "completed"
+        if stop_event and stop_event.is_set(): 
+            final_status = session.get('termination_reason', 'terminated')
+        elif 'remaining_time' in locals() and remaining_time < ESTIMATED_TURN_DURATION_SECONDS: 
+            final_status = "time_limit_reached"
+        elif final_elapsed >= interview_duration_seconds : 
+            final_status = "time_limit_reached"
+        elif questions_asked_count >= max_questions: 
+            final_status = "max_questions_reached"
+        else: 
+            final_status = "completed"
 
         return { "status": final_status, "session_id": session_id, "questions_asked": questions_asked_count, "final_transcript_summary": transcript }
 
     def _play_audio_stream(self, audio_chunk_iterator: iter, meet: MeetController, stop_event: threading.Event) -> bool:
-        """
-        Play audio from a generator that yields audio_bytes chunks.
-        (This function is blocking and is intended to be run in a thread)
-        """
-        
+        # ... (This function remains identical) ...
         audio_queue = queue.Queue(maxsize=100) 
         stream_finished_event = threading.Event() 
         generator_finished_event = threading.Event() 
         
         def feeder_thread_func():
-            """Pulls from Gemini/TTS iterator and puts np arrays into queue."""
             try:
                 for audio_chunk_bytes in audio_chunk_iterator:
                     if stop_event.is_set() or stream_finished_event.is_set():
@@ -398,7 +420,6 @@ class MeetInterviewOrchestrator:
             outdata[:] = internal_buffer[:frames].reshape(-1, 1)
             internal_buffer = internal_buffer[frames:]
 
-        # --- Start Execution ---
         try:
             feeder_thread = threading.Thread(target=feeder_thread_func, daemon=True, name="AudioFeeder")
             feeder_thread.start()
@@ -407,7 +428,7 @@ class MeetInterviewOrchestrator:
             logger.info(f"🔊 Playing audio stream to device {output_device}...")
 
             stream = sd.OutputStream(
-                samplerate=self.target_samplerate, # 24000 Hz
+                samplerate=self.target_samplerate,
                 device=output_device,
                 channels=1,
                 dtype='float32',
@@ -453,7 +474,6 @@ class MeetInterviewOrchestrator:
         
         return path_24k_stt
     
-    # --- NEW HYBRID FUNCTION ---
     def _record_and_process_stt_streaming_manual_vad(
         self,
         session_id: str,

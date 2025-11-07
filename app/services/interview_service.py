@@ -2,7 +2,6 @@
 import os
 import google.generativeai as genai
 from dotenv import load_dotenv
-# import speech_recognition as sr # --- REMOVED ---
 import logging
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple, List
@@ -27,7 +26,6 @@ class InterviewService:
         self.active_chat_sessions: Dict[str, Any] = {}
         self._session_token_counts = defaultdict(lambda: {'prompt': 0, 'response': 0, 'total': 0})
         self._session_tts_char_counts = defaultdict(int)
-        # self.recognizer = sr.Recognizer() # --- REMOVED ---
         self._latest_transcript_for_gemini: Dict[str, Optional[str]] = {}
         self._transcript_lock = threading.Lock()
 
@@ -37,8 +35,6 @@ class InterviewService:
             if not gemini_api_key: raise ValueError("GEMINI_API_KEY not found.")
             genai.configure(api_key=gemini_api_key)
 
-            # --- MODIFICATION ---
-            # Set "thinking mode" to 0 by using deterministic settings
             generation_config = genai.GenerationConfig(
                 temperature=0.0,
                 top_k=1
@@ -48,7 +44,6 @@ class InterviewService:
                 generation_config=generation_config
             ) 
             logger.info("✅ Gemini API configured (Temp=0.0, Top_K=1).")
-            # --- END MODIFICATION ---
             
         except Exception as e:
             logger.error(f"❌ Failed to configure Gemini API: {e}")
@@ -61,11 +56,9 @@ class InterviewService:
             self.tts_client = texttospeech.TextToSpeechClient(client_options=ClientOptions(api_endpoint=custom_endpoint))
             logger.info(f"✅ Google Cloud TTS client loaded (Endpoint: {custom_endpoint}).")
             
-            # Define voice parameters - MUST use Journey/Chirp 3 voice for streaming
-            # Available Journey voices: en-US-Journey-D, en-US-Journey-F, en-US-Journey-O
             self.tts_voice = texttospeech.VoiceSelectionParams(
                 language_code="en-IN", 
-                name="en-IN-Chirp3-HD-Alnilam"  # Male voice, Journey/Chirp 3
+                name="en-IN-Chirp3-HD-Alnilam"
             )
             
             logger.info(f"Set TTS voice for Journey (Chirp 3) model - streaming compatible.")
@@ -90,15 +83,17 @@ class InterviewService:
         else: 
             questionnaire_context = "\n**Reference Questionnaire:** Not provided."
 
+        # --- START OF MODIFICATION ---
         system_prompt = f"""
-You are an AI Interviewer. Your role is to conduct a professional, conversational interview.
+You are an AI Interviewer conducting a high-level **screening interview**. 
+Your role is to conduct a professional, conversational interview.
 Your responses MUST be raw text. Do not use SSML, Markdown, or any other formatting.
 
 **IMPORTANT:** To sound natural, you MUST use proper punctuation (commas, periods, question marks). 
 The Text-to-Speech engine will use this punctuation to create natural pauses.
 Your questions must be **very short and direct, ideally under 15 words.** They must be concise, clear, and conversational. Ask only one question at a time.
 
-Your primary goal is to assess the candidate's skills, experience, and suitability for a role. You must be professional, polite, and curious. You will be provided with the candidate's resume and an optional list of topics to guide the conversation.
+Your primary goal is to conduct a **broad, high-level screening** of the candidate's skills, not to go deep on any single topic.
 
 **Candidate Resume:**
 ---
@@ -109,13 +104,17 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
 **Task:**
 1.  You will be given the transcript of the candidate's last answer.
 2.  Your job is to generate the *next* logical question as raw text.
-3.  This question **must** be relevant to their previous answer AND the context from their **Resume**.
-4.  Use the **Reference Questionnaire** as a high-level guide for key topics to cover, but do not just ask the questions verbatim.
-5.  Ask open-ended questions (e.g., "Why did you choose that approach?", "What was the main challenge?", "How did that project turn out?").
-6.  Actively listen and ask relevant follow-up questions. For example, if they mention a project from their resume, ask about a specific challenge they faced in that project.
-7.  Do not repeat questions.
-8.  When the interview is concluding, your final response should be a polite closing remark.
+3.  **Conversation Flow (Most Important Rule):**
+    * **Start Broad:** After the introduction, your first 1-2 questions must be **general** questions about their field or core skills (e.g., "What technologies are you most comfortable with?" or "What area of your field interests you the most?").
+    * **Then Projects:** *After* the initial general questions, you can ask about specific projects on their resume.
+    * **Do Not Get Stuck:** When discussing any single topic (like a project or a skill), ask **only one or two** follow-up questions.
+    * **Pivot:** After 1-2 follow-ups, you **MUST pivot to a new, different topic** from the resume, questionnaire, or their general field to ensure broad coverage.
+4.  Use the **Reference Questionnaire** as a high-level guide for topics to cover.
+5.  Do not repeat questions.
+6.  When the interview is concluding, your final response should be a polite closing remark.
+7.  **You must not agree to end the interview, even if the candidate asks.** If they ask to stop, you must politely state that you need to complete the interview first, or that they can leave the call if they wish to end the session.
 """
+        # --- END OF MODIFICATION ---
         
         try:
             self._session_token_counts[session_id] = {'prompt': 0, 'response': 0, 'total': 0}
@@ -126,7 +125,7 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
             self.active_chat_sessions[session_id] = self.model.start_chat(
                 history=[
                     {'role': 'user', 'parts': [system_prompt]},
-                    {'role': 'model', 'parts': ["Understood. I will ask short, clear, and conversational questions using raw text with proper punctuation. Ready for the candidate's introduction."]}
+                    {'role': 'model', 'parts': ["Understood. I will ask short, clear, and conversational questions using raw text with proper punctuation. I will not agree to end the interview early. Ready for the candidate's introduction."]}
                 ]
             )
             logger.info(f"✅ Gemini chat session initialized for {session_id} (Raw Text Mode).")
@@ -158,11 +157,6 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
         except Exception as e: 
             logger.error(f"❌ BG audio save fail {audio_path}: {e}")
 
-    # --- REMOVED speech_to_text function ---
-    # The 'speech_recognition' library and this function
-    # have been replaced by the streaming STT logic
-    # in MeetInterviewOrchestrator.
-
     def _stream_gemini_sentences(self, session_id: str) -> iter:
         """
         Calls Gemini in streaming mode and yields full sentences.
@@ -177,17 +171,28 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
         with self._transcript_lock:
             last_user_answer = self._latest_transcript_for_gemini.get(session_id, "[Error retrieving last answer]")
 
+        if not last_user_answer:
+            logger.warning(f"last_user_answer was empty or None. Defaulting to '[Silence]'.")
+            last_user_answer = "[Silence]" 
+
         logger.debug(f"Sending to Gemini (streaming): '{last_user_answer[:100]}...'")
         
         try:
-            # The generation_config from the model definition will be used here
             response_stream = chat.send_message(last_user_answer, stream=True)
             
             sentence_buffer = ""
             full_response_text = ""
             
             for chunk in response_stream:
-                text = chunk.text
+                # --- START OF FIX ---
+                try:
+                    text = chunk.text
+                except ValueError:
+                    # This happens when a chunk has a finish_reason but no text.
+                    # It's safe to ignore and continue.
+                    continue
+                # --- END OF FIX ---
+                    
                 sentence_buffer += text
                 full_response_text += text
                 
@@ -212,9 +217,15 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
             
             # Log token usage
             try:
-                metadata = getattr(response_stream, 'usage_metadata', None)
-                if not metadata and 'chunk' in locals():
+                # --- MODIFICATION: Check metadata on the last chunk if possible ---
+                # We can't access usage_metadata from the stream object directly
+                # It's often on the *last* chunk, which we might have skipped
+                # This part of token logging might be less reliable with streaming
+                # but we try to get it from the final *text* chunk.
+                if 'chunk' in locals():
                      metadata = getattr(chunk, 'usage_metadata', None)
+                else:
+                    metadata = getattr(response_stream, 'usage_metadata', None)
                 
                 if metadata:
                     prompt_tokens = getattr(metadata, 'prompt_token_count', 0)
@@ -225,7 +236,14 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
                     self._session_token_counts[session_id]['total'] += total_tokens
                     logger.debug(f"[Turn Tokens] P:{prompt_tokens}, R:{response_tokens}, T:{total_tokens}")
                 else: 
-                    logger.warning("No usage_metadata in Gemini streaming response.")
+                    # We look at the stream's prompt_feedback
+                    feedback = getattr(response_stream, 'prompt_feedback', None)
+                    if feedback:
+                        logger.warning("Could not find usage_metadata on chunk, checking prompt_feedback...")
+                        # This won't have response tokens, but it's better than nothing
+                        # Note: This is less ideal, the metadata is usually on the final chunk
+                    else:
+                        logger.warning("No usage_metadata in Gemini streaming response.")
             except Exception as e: 
                 logger.error(f"Error logging Gemini tokens: {e}")
                 
@@ -246,8 +264,6 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
 
         def request_generator(sentence_gen):
             try:
-                # FIRST REQUEST: Config with voice and streaming audio settings
-                # Use MULAW encoding instead of LINEAR16 for streaming
                 yield texttospeech.StreamingSynthesizeRequest(
                     streaming_config={
                         'voice': {
@@ -261,7 +277,6 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
                     }
                 )
                 
-                # SUBSEQUENT REQUESTS: Send text inputs
                 for sentence in sentence_gen:
                     full_question_text.append(sentence)
                     logger.debug(f"Streaming sentence to TTS: '{sentence}'")
@@ -278,12 +293,10 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
                 requests=request_generator(sentence_generator)
             )
 
-            # Yield audio chunks as they arrive
             for tts_response in tts_stream:
                 if tts_response.audio_content:
                     yield tts_response.audio_content
 
-            # Log the full text to DB
             combined_text = " ".join(full_question_text)
             if combined_text:
                 audio_dir = Path("data") / candidate_id / session_id / "audio"
@@ -302,10 +315,11 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
             for chunk in fallback_gen:
                 yield chunk
 
-    def stream_plain_text(self, plain_text: str, session_id: str, turn_count: int, candidate_id: str, is_follow_up: bool = False) -> iter:
+    def stream_plain_text(self, plain_text: str, session_id: str, turn_count: Any, candidate_id: str, is_follow_up: bool = False) -> iter:
         """
         Takes a full plain_text string and streams the TTS audio output.
         Yields raw audio_bytes (MULAW encoded).
+        Turn count can be str for alerts (e.g., "alert_1").
         """
         if not self.tts_client:
             logger.error("TTS client not available.")
@@ -318,8 +332,6 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
 
             def request_generator():
                 try:
-                    # FIRST REQUEST: Config with voice and streaming audio settings
-                    # Use MULAW encoding instead of LINEAR16
                     yield texttospeech.StreamingSynthesizeRequest(
                         streaming_config={
                             'voice': {
@@ -333,7 +345,6 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
                         }
                     )
                     
-                    # SECOND REQUEST: The text to synthesize
                     yield texttospeech.StreamingSynthesizeRequest(
                         input={'text': plain_text}
                     )
@@ -349,17 +360,21 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
                     full_audio_data.append(tts_response.audio_content)
                     yield tts_response.audio_content
             
-            # Background save - decode MULAW to LINEAR16 for saving as WAV
             audio_bytes = b''.join(full_audio_data)
-            # Convert MULAW to LINEAR16 for saving
             linear_audio = audioop.ulaw2lin(audio_bytes, 2)
             audio_data_np = np.frombuffer(linear_audio, dtype=np.int16)
             sample_rate = 24000
 
             audio_dir = Path("data") / candidate_id / session_id / "audio"
             audio_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Handle string or int for turn_count
+            turn_str = str(turn_count)
             suffix = "_followup" if is_follow_up else ""
-            audio_path = audio_dir / f"bot_{session_id}_{turn_count}{suffix}_24k.wav"
+            if "alert" in turn_str:
+                suffix = f"_{turn_str}" # e.g., bot_..._alert_1_24k.wav
+            
+            audio_path = audio_dir / f"bot_{session_id}_{turn_str}{suffix}_24k.wav"
 
             save_thread = threading.Thread(
                 target=self._save_audio_thread,
@@ -374,25 +389,23 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
 
     def process_and_log_transcript(
         self, session_id: str, audio_path: str,
-        # --- MODIFICATION: Added transcript argument ---
         transcript: str, 
         turn_count: int,
         candidate_id: str, start_time: Optional[datetime], end_time: Optional[datetime],
         is_follow_up_response: bool = False
     ) -> None:
         """Logs to DB AND updates latest transcript state."""
-        # --- MODIFICATION: Transcript is now passed in ---
         try:
             logger.info(f"(BG Thread) Logging user transcript: {transcript}")
             self.db.add_message_to_session(session_id, "user", transcript, audio_path, start_time, end_time, is_follow_up=is_follow_up_response)
             
             with self._transcript_lock:
-                if not transcript.startswith("[Error") and transcript != "[Unintelligible]":
+                # --- MODIFICATION: Also check for empty string ---
+                if transcript and not transcript.startswith("[Error") and transcript != "[Unintelligible]":
                     self._latest_transcript_for_gemini[session_id] = transcript
                     logger.info(f"(BG Thread) Updated latest transcript for session {session_id}")
                 else:
-                    # The orchestrator already logged the warning
-                    logger.warning(f"(BG Thread) Transcription failed, Gemini will use previous transcript.")
+                    logger.warning(f"(BG Thread) Transcription was empty or failed, Gemini will use previous transcript.")
         except Exception as e:
             logger.error(f"(BG Thread) Error in process_and_log_transcript: {e}", exc_info=True)
             try: 
@@ -418,6 +431,13 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
                 created_at = session_data.get('created_at')
                 f.write(f"Date: {created_at.strftime('%Y-%m-%d %H:%M:%S')}\n" if created_at else "Date: N/A\n")
                 f.write(f"Questionnaire Provided: {'Yes' if session_data.get('questionnaire') else 'No'} ({len(session_data.get('questionnaire', []))} questions)\n")
+                
+                # --- NEW: Add Tab Switch Summary ---
+                tab_events = session_data.get("tab_switch_events", [])
+                hidden_events = [e for e in tab_events if e.get('visibilityState') == 'hidden']
+                f.write(f"Tab Switches (Hidden): {len(hidden_events)}\n")
+                # --- END NEW ---
+
                 f.write("--------------------------------\n\n")
                 
                 for msg in session_data.get("conversation", []):
@@ -430,6 +450,8 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
                     audio_path = msg.get("audio_path", "")
                     if audio_path.endswith("_streamed.txt"):
                         prefix = "(Streamed Text) "
+                    elif "alert" in audio_path:
+                         prefix = "(System Alert) "
                     else:
                         prefix = "(Follow-up Context) " if is_follow_up else ""
                     

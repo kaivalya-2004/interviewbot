@@ -25,9 +25,14 @@ class DBHandler:
     def create_session(self, resume_text: str, candidate_id: str, questionnaire: List[str]) -> str:
         """Creates a new interview session record."""
         session_data = {
-            "candidate_id": candidate_id, "resume_text": resume_text,
-            "questionnaire": questionnaire, "conversation": [],
+            "candidate_id": candidate_id, 
+            "resume_text": resume_text,
+            "questionnaire": questionnaire, 
+            "conversation": [],
+            # --- tab_switch_events REMOVED ---
             "created_at": datetime.now(),
+            "status": "pending",
+            # --- device_type and user_agent REMOVED ---
         }
         result = self.sessions.insert_one(session_data)
         logger.info(f"Created session {result.inserted_id} with {len(questionnaire)} questions.")
@@ -72,7 +77,6 @@ class DBHandler:
         """Retrieves a session document by its ID."""
         if not session_id: logger.error("Attempted to get session with empty session_id."); return None
         try:
-            # Validate ObjectId format before querying
             if not ObjectId.is_valid(session_id):
                  logger.error(f"Invalid ObjectId format for session_id: {session_id}")
                  return None
@@ -83,3 +87,20 @@ class DBHandler:
         except Exception as e:
             logger.error(f"Unexpected error fetching session {session_id}: {e}", exc_info=True)
             return None
+
+    # --- add_tab_switch_events method REMOVED ---
+
+    def update_session_status(self, session_id: str, status: str):
+        """Updates the 'status' field of a session."""
+        if self.db is None:
+            logger.error("Database not initialized, cannot update status.")
+            return
+        try:
+            self.sessions.update_one(
+                {"_id": ObjectId(session_id)},
+                {"$set": {"status": status}}
+            )
+        except Exception as e:
+            logger.error(f"DB Error updating status for {session_id}: {e}", exc_info=True)
+
+    # --- update_session_device_info method REMOVED ---

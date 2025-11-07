@@ -2,7 +2,7 @@
 import os
 import google.generativeai as genai
 from dotenv import load_dotenv
-import speech_recognition as sr
+# import speech_recognition as sr # --- REMOVED ---
 import logging
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple, List
@@ -27,7 +27,7 @@ class InterviewService:
         self.active_chat_sessions: Dict[str, Any] = {}
         self._session_token_counts = defaultdict(lambda: {'prompt': 0, 'response': 0, 'total': 0})
         self._session_tts_char_counts = defaultdict(int)
-        self.recognizer = sr.Recognizer()
+        # self.recognizer = sr.Recognizer() # --- REMOVED ---
         self._latest_transcript_for_gemini: Dict[str, Optional[str]] = {}
         self._transcript_lock = threading.Lock()
 
@@ -36,8 +36,20 @@ class InterviewService:
             gemini_api_key = os.getenv("GEMINI_API_KEY")
             if not gemini_api_key: raise ValueError("GEMINI_API_KEY not found.")
             genai.configure(api_key=gemini_api_key)
-            self.model = genai.GenerativeModel('gemini-2.5-flash') 
-            logger.info("✅ Gemini API configured.")
+
+            # --- MODIFICATION ---
+            # Set "thinking mode" to 0 by using deterministic settings
+            generation_config = genai.GenerationConfig(
+                temperature=0.0,
+                top_k=1
+            )
+            self.model = genai.GenerativeModel(
+                'gemini-2.5-flash',
+                generation_config=generation_config
+            ) 
+            logger.info("✅ Gemini API configured (Temp=0.0, Top_K=1).")
+            # --- END MODIFICATION ---
+            
         except Exception as e:
             logger.error(f"❌ Failed to configure Gemini API: {e}")
             self.model = None
@@ -146,31 +158,10 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
         except Exception as e: 
             logger.error(f"❌ BG audio save fail {audio_path}: {e}")
 
-    def speech_to_text(self, audio_path: str) -> str:
-        if not Path(audio_path).exists(): 
-            logger.error(f"STT file missing: {audio_path}")
-            return "[Error: Audio file missing]"
-        with sr.AudioFile(audio_path) as source:
-            try: 
-                logger.debug(f"STT record: {audio_path}...")
-                audio_data = self.recognizer.record(source)
-                logger.debug("STT recognize...")
-            except Exception as e: 
-                logger.error(f"STT record fail: {e}")
-                return "[Error recording segment]"
-            try: 
-                text = self.recognizer.recognize_google(audio_data)
-                logger.info(f"STT ok: '{text}'")
-                return text
-            except sr.UnknownValueError: 
-                logger.warning("STT unclear.")
-                return "[Unintelligible]"
-            except sr.RequestError as e: 
-                logger.error(f"STT service err: {e}")
-                return "[Speech service error]"
-            except Exception as e: 
-                logger.error(f"STT unexpected err: {e}", exc_info=True)
-                return "[STT Error]"
+    # --- REMOVED speech_to_text function ---
+    # The 'speech_recognition' library and this function
+    # have been replaced by the streaming STT logic
+    # in MeetInterviewOrchestrator.
 
     def _stream_gemini_sentences(self, session_id: str) -> iter:
         """
@@ -189,6 +180,7 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
         logger.debug(f"Sending to Gemini (streaming): '{last_user_answer[:100]}...'")
         
         try:
+            # The generation_config from the model definition will be used here
             response_stream = chat.send_message(last_user_answer, stream=True)
             
             sentence_buffer = ""
@@ -381,15 +373,17 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
             return
 
     def process_and_log_transcript(
-        self, session_id: str, audio_path: str, turn_count: int,
+        self, session_id: str, audio_path: str,
+        # --- MODIFICATION: Added transcript argument ---
+        transcript: str, 
+        turn_count: int,
         candidate_id: str, start_time: Optional[datetime], end_time: Optional[datetime],
         is_follow_up_response: bool = False
     ) -> None:
-        """Transcribes, logs to DB, AND updates latest transcript state."""
-        transcript = "[Error during transcription process]"
+        """Logs to DB AND updates latest transcript state."""
+        # --- MODIFICATION: Transcript is now passed in ---
         try:
-            logger.info(f"(BG Thread) Transcribing user audio: {audio_path}")
-            transcript = self.speech_to_text(audio_path)
+            logger.info(f"(BG Thread) Logging user transcript: {transcript}")
             self.db.add_message_to_session(session_id, "user", transcript, audio_path, start_time, end_time, is_follow_up=is_follow_up_response)
             
             with self._transcript_lock:
@@ -397,7 +391,8 @@ Your primary goal is to assess the candidate's skills, experience, and suitabili
                     self._latest_transcript_for_gemini[session_id] = transcript
                     logger.info(f"(BG Thread) Updated latest transcript for session {session_id}")
                 else:
-                    logger.warning(f"(BG Thread) Transcription failed for {audio_path}, Gemini will use previous transcript.")
+                    # The orchestrator already logged the warning
+                    logger.warning(f"(BG Thread) Transcription failed, Gemini will use previous transcript.")
         except Exception as e:
             logger.error(f"(BG Thread) Error in process_and_log_transcript: {e}", exc_info=True)
             try: 

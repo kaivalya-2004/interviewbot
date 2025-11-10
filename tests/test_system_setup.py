@@ -285,6 +285,7 @@ def test_client():
     return TestClient(app)
 
 
+# --- FIX: Changed Zfixture to fixture ---
 @pytest.fixture(scope="function")
 def mock_services():
     """Fixture to mock all services for testing"""

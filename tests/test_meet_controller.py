@@ -3,6 +3,7 @@ import pytest
 from unittest.mock import Mock, patch, MagicMock
 import time
 from pathlib import Path
+from selenium.common.exceptions import TimeoutException, JavascriptException
 
 # --- Setup Path ---
 import sys, os
@@ -18,7 +19,7 @@ from app.services.meet_controller import MeetController
 def mock_chrome_driver():
     """Mock Chrome driver"""
     with patch('app.services.meet_controller.uc.Chrome') as mock_chrome:
-        driver_instance = Mock()
+        driver_instance = MagicMock(name="DriverInstance")
         driver_instance.current_url = "https://meet.google.com/abc-defg-hij"
         driver_instance.get_screenshot_as_png.return_value = b'\x89PNG\r\n' + b'\x00' * 1000
         
@@ -33,7 +34,9 @@ def mock_chrome_driver():
 def meet_controller(mock_chrome_driver):
     """Create MeetController instance with mocked driver"""
     controller = MeetController(headless=True, use_vb_audio=False)
-    controller.setup_driver()
+    # Patch os.makedirs during setup to avoid creating real dirs
+    with patch('os.makedirs'):
+        controller.setup_driver()
     return controller
 
 
@@ -56,7 +59,8 @@ class TestMeetController:
     def test_setup_driver_success(self, mock_chrome_driver):
         """Test successful driver setup"""
         controller = MeetController(headless=True)
-        result = controller.setup_driver()
+        with patch('os.makedirs'):
+            result = controller.setup_driver()
         
         assert result is True
         assert controller.driver is not None
@@ -64,7 +68,8 @@ class TestMeetController:
     def test_setup_driver_with_vb_audio(self, mock_chrome_driver):
         """Test driver setup with VB Audio configuration"""
         controller = MeetController(headless=True, use_vb_audio=True, audio_device_index=2)
-        result = controller.setup_driver()
+        with patch('os.makedirs'):
+            result = controller.setup_driver()
         
         assert result is True
         # Verify audio device configuration was attempted
@@ -76,7 +81,8 @@ class TestMeetController:
             mock_chrome.side_effect = Exception("Driver setup failed")
             
             controller = MeetController(headless=True)
-            result = controller.setup_driver()
+            with patch('os.makedirs'):
+                result = controller.setup_driver()
             
             assert result is False
 
@@ -90,7 +96,7 @@ class TestMeetController:
             mock_button = Mock()
             mock_wait.return_value.until.return_value = mock_button
             
-            # --- FIX: Removed the patch.object for the non-existent 'turn_on_captions' ---
+            # --- REMOVED patch.object for 'turn_on_captions' ---
             result = meet_controller.join_meeting(meet_link, display_name)
             
             assert result is True
@@ -107,8 +113,6 @@ class TestMeetController:
 
     def test_join_meeting_button_not_found(self, meet_controller, mock_chrome_driver):
         """Test join meeting when join button not found"""
-        from selenium.common.exceptions import TimeoutException
-        
         with patch('app.services.meet_controller.WebDriverWait') as mock_wait:
             mock_wait.return_value.until.side_effect = TimeoutException()
             
@@ -116,7 +120,7 @@ class TestMeetController:
             
             assert result is False
 
-    # --- FIX: Removed test_turn_on_captions ---
+    # --- REMOVED test_turn_on_captions ---
 
     def test_enable_microphone(self, meet_controller, mock_chrome_driver):
         """Test enabling microphone"""
@@ -190,8 +194,12 @@ class TestMeetController:
 
     def test_get_participant_count_fallback_ui(self, meet_controller, mock_chrome_driver):
         """Test participant count fallback to UI button"""
+        # --- UPDATED: Use side_effect to test fallback ---
         # First call (JS) returns None, fallback should be used
-        mock_chrome_driver.execute_script.return_value = None
+        mock_chrome_driver.execute_script.side_effect = [
+            None, # JS unique IDs fails
+            JavascriptException("Other JS error") # JS video count fails (if it got this far)
+        ]
         
         with patch('app.services.meet_controller.WebDriverWait') as mock_wait:
             mock_button = Mock()
@@ -202,27 +210,37 @@ class TestMeetController:
             count = meet_controller.get_participant_count()
             
             assert count == 3
+            # Ensure the JS ID script was at least tried
+            script_call = mock_chrome_driver.execute_script.call_args_list[0][0][0]
+            assert "[data-participant-id]" in script_call
 
     def test_get_participant_count_fallback_video(self, meet_controller, mock_chrome_driver):
         """Test participant count fallback to video count"""
-        # All other methods fail, use video count
+        # --- UPDATED: Use side_effect to test full fallback chain ---
         mock_chrome_driver.execute_script.side_effect = [
             None, # Call 1: JS for unique IDs fails
             2     # Call 2: JS for video count succeeds
         ]
         
         with patch('app.services.meet_controller.WebDriverWait') as mock_wait:
-            mock_wait.return_value.until.side_effect = Exception("Button not found")
+            # Mock UI button method to fail
+            mock_wait.return_value.until.side_effect = TimeoutException("Button not found")
             
             count = meet_controller.get_participant_count()
             
             assert count == 2
+            # Check that the second JS script (video count) was called
+            script_call = mock_chrome_driver.execute_script.call_args[0][0]
+            assert "document.querySelectorAll('video')" in script_call
 
     def test_get_participant_count_error_handling(self, meet_controller, mock_chrome_driver):
         """Test participant count with all methods failing"""
-        mock_chrome_driver.execute_script.side_effect = Exception("All methods failed")
+        mock_chrome_driver.execute_script.side_effect = JavascriptException("All JS methods failed")
         
-        count = meet_controller.get_participant_count()
+        with patch('app.services.meet_controller.WebDriverWait') as mock_wait:
+            mock_wait.return_value.until.side_effect = TimeoutException("Button not found")
+            
+            count = meet_controller.get_participant_count()
         
         # Should return 1 as default
         assert count == 1
@@ -235,6 +253,8 @@ class TestMeetController:
         
         # Verify script was executed
         assert mock_chrome_driver.execute_script.called
+        script_call = mock_chrome_driver.execute_script.call_args[0][0]
+        assert "Leave call" in script_call
 
     def test_leave_meeting_fallback(self, meet_controller, mock_chrome_driver):
         """Test leave meeting with fallback"""
@@ -247,8 +267,10 @@ class TestMeetController:
             
             meet_controller.leave_meeting()
             
-            # Should attempt both methods
+            # Should attempt JS
             assert mock_chrome_driver.execute_script.called
+            # Should attempt Selenium
+            mock_wait.return_value.until.assert_called()
 
     def test_cleanup_success(self, meet_controller, mock_chrome_driver):
         """Test successful cleanup"""
@@ -270,9 +292,10 @@ class TestMeetController:
 
     def test_context_manager(self, mock_chrome_driver):
         """Test using controller as context manager"""
-        with MeetController(headless=True) as controller:
-            controller.setup_driver()
-            assert controller.driver is not None
+        with patch('os.makedirs'):
+            with MeetController(headless=True) as controller:
+                controller.setup_driver()
+                assert controller.driver is not None
         
         # Driver should be cleaned up after context
         assert mock_chrome_driver.close.called
@@ -292,7 +315,8 @@ class TestMeetController:
         profile_dir = "/path/to/profile"
         
         controller = MeetController(headless=True, user_data_dir=profile_dir)
-        controller.setup_driver()
+        with patch('os.makedirs'):
+            controller.setup_driver()
         
         assert controller.user_data_dir == profile_dir
 

@@ -26,6 +26,7 @@ from app.services.meet_session_manager import MeetSessionManager
 @pytest.fixture
 def mock_db_handler():
     """Mocks the DBHandler for the session manager."""
+    # We patch the import location, not the source
     with patch('app.services.meet_session_manager.DBHandler') as mock:
         db_instance = MagicMock(name="DBHandler_Instance")
         db_instance.get_session.return_value = {
@@ -146,6 +147,9 @@ class TestStartBotSession:
         assert "controller" in session
         assert "stop_capture" in session
         assert "stop_interview" in session
+        # Assert removed keys are gone
+        assert "tab_switch_events" not in session
+        assert "device_type" not in session
 
     def test_start_bot_session_driver_fail(self, session_manager, mock_meet_controller_class):
         """Test session fails if driver setup fails"""
@@ -399,10 +403,6 @@ class TestWaitForCandidate:
         
         assert joined is True
 
-
-# Replace the TestVideoCaptureIntegration class with this updated version
-
-# Replace the entire TestVideoCaptureIntegration class with this version
 
 class TestVideoCaptureIntegration:
     """Tests for video capture functionality"""
@@ -725,34 +725,58 @@ class TestGetMethods:
         count = session_manager.get_snapshot_count(session_id)
         assert count == 10
 
+    # --- UPDATED TEST ---
     def test_get_snapshot_count_from_disk(self, session_manager, mock_db_handler, tmp_path):
-        """Test getting snapshot count from disk"""
+        """Test getting snapshot count from disk for a non-active session"""
         session_id = "s_disk"
         candidate_id = "c_disk"
         
-        # Setup mock DB to return session data
+        # Setup mock DB to return session data for the *non-active* session
         mock_db_handler.get_session.return_value = {
             "session_id": session_id,
             "candidate_id": candidate_id
         }
         
-        # Create fake snapshots
+        # Create fake snapshots in the tmp_path
+        # The code will look for "data" / candidate_id / session_id / "snapshots"
         snapshot_dir = tmp_path / "data" / candidate_id / session_id / "snapshots"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         for i in range(5):
             (snapshot_dir / f"snapshot_{i}.jpg").touch()
-        
-        # Mock Path
-        with patch('app.services.meet_session_manager.Path') as mock_path:
-            def path_side_effect(arg):
-                if arg == "data":
-                    return tmp_path / "data"
-                return Path(arg)
+        # Add a non-jpg file to be ignored
+        (snapshot_dir / "log.txt").touch()
+
+        # We need to patch `Path` *where it is used*: in `app.services.meet_session_manager`
+        # We will make Path("data") return our temp "data" directory
+        with patch('app.services.meet_session_manager.Path') as mock_path_constructor:
             
-            mock_path.side_effect = path_side_effect
+            # This side effect will intercept the Path("data") call
+            def path_side_effect(arg):
+                if str(arg) == "data":
+                    # Return the *root* of our temp data folder
+                    return tmp_path / "data"
+                # Allow other Path calls to work as normal (e.g., Path("chrome_profile"))
+                # Note: This relies on Path being used with an absolute path or a known relative root
+                # This is a bit fragile, but works for Path("data")
+                return Path(arg) 
+            
+            # A more robust mock:
+            # Re-create the Path object's behavior for our specific case
+            mock_data_path = tmp_path / "data"
+            
+            def new_path_constructor(arg):
+                if str(arg) == "data":
+                    return mock_data_path
+                return Path(arg) # default behavior
+
+            mock_path_constructor.side_effect = new_path_constructor
+            
+            # Ensure the session is NOT active
+            session_manager.active_sessions.pop(session_id, None)
             
             count = session_manager.get_snapshot_count(session_id)
-            # Will return 0 because session is not active and mocking is complex
+            assert count == 5
+    # --- END UPDATED TEST ---
 
     def test_get_snapshot_count_no_session(self, session_manager, mock_db_handler):
         """Test snapshot count when no session data"""
@@ -818,6 +842,9 @@ class TestGetMethods:
         assert "s2" in all_sessions
         assert all_sessions["s1"]["candidate_id"] == "c1"
         assert all_sessions["s2"]["candidate_id"] == "c2"
+        # Assert removed keys are gone
+        assert "tab_switches" not in all_sessions["s1"]
+        assert "device_type" not in all_sessions["s1"]
 
     def test_get_all_active_sessions_empty(self, session_manager):
         """Test getting all sessions when none active"""

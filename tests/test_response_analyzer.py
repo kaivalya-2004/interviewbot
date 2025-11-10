@@ -51,9 +51,13 @@ def test_detect_non_committal_response(transcript, expected):
     ("", False),
     ("   ", False),
     ("I heard you perfectly.", False),
-    ("I am not sorry for my answer.", False),
     ("Don't repeat yourself.", False),
-    ("I can hear you just fine.", False)
+    ("I can hear you just fine.", False),
+    
+    # --- NEW: Edge cases for "sorry" ---
+    ("I am not sorry for my answer.", False),
+    ("I'm not sorry about that.", False),
+    ("He said he wasn't sorry.", False),
 ])
 def test_detect_repeat_request(transcript, expected):
     """

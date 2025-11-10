@@ -161,6 +161,17 @@ class TestListAllAudioDevices:
             devices = VirtualAudioConfig.list_all_audio_devices()
             assert len(devices) == 0
 
+    def test_list_devices_handles_cast_properly(self, mock_query_devices):
+        """Tests that device list casting works correctly with type hints."""
+        devices = VirtualAudioConfig.list_all_audio_devices()
+        
+        # Verify we can iterate and access device properties
+        assert len(devices) > 0
+        for idx, device in enumerate(devices):
+            assert 'name' in device
+            assert 'max_input_channels' in device
+            assert 'max_output_channels' in device
+
 
 class TestFindDeviceByName:
     """Tests for VirtualAudioConfig.find_device_by_name"""
@@ -246,6 +257,12 @@ class TestFindDeviceByName:
         result = VirtualAudioConfig.find_device_by_name(['BlackHole'], device_type="both")
         
         assert result == 7
+
+    def test_find_device_with_cast_typing(self, mock_query_devices):
+        """Tests that the cast() typing utility doesn't break device finding."""
+        # This implicitly tests the cast implementation in the actual code
+        result = VirtualAudioConfig.find_device_by_name(['CABLE Input'], device_type="output")
+        assert result == 2
 
 
 class TestGetVirtualOutputDevice:
@@ -341,7 +358,7 @@ class TestTestVirtualAudioSetup:
 
     def test_setup_no_input_device(self, caplog):
         """Tests setup warning when input device is missing."""
-        # Create devices with only output (no input) - exclude ALL virtual input devices
+        # Create devices with only output (no input)
         devices_no_input = [
             d for d in MOCK_DEVICES 
             if d['name'] != 'CABLE Output (VB-Audio Virtual Cable)' 
@@ -378,7 +395,7 @@ class TestVerifySampleRateSupport:
 
     def test_verify_sample_rate_success(self, mock_query_devices, mock_check_output_settings):
         """Tests successful sample rate verification."""
-        # Mock single device query
+        # Mock single device query to return a dict (not a list)
         with patch('sounddevice.query_devices', return_value=MOCK_DEVICES[2]):
             result = VirtualAudioConfig.verify_sample_rate_support(2, 48000)
         
@@ -510,3 +527,62 @@ class TestIntegrationScenarios:
         with patch('sounddevice.query_devices', return_value=MOCK_DEVICES[output_idx]):
             supported = VirtualAudioConfig.verify_sample_rate_support(output_idx, 48000)
             assert supported is True
+
+
+class TestProductionReadiness:
+    """Production-specific tests to ensure robustness"""
+    
+    def test_handles_unicode_device_names(self, caplog):
+        """Tests handling of device names with unicode characters."""
+        unicode_devices = [
+            {
+                'name': 'Micrófono (Realtek™ Audio)',
+                'index': 0,
+                'max_input_channels': 2,
+                'max_output_channels': 0,
+                'default_samplerate': 48000.0
+            }
+        ]
+        
+        with patch('sounddevice.query_devices', return_value=MockDeviceList(unicode_devices)):
+            devices = VirtualAudioConfig.list_all_audio_devices()
+            assert len(devices) == 1
+    
+    def test_thread_safety_device_queries(self, mock_query_devices):
+        """Tests that concurrent device queries don't cause issues."""
+        import threading
+        
+        results = []
+        
+        def query_device():
+            result = VirtualAudioConfig.get_virtual_output_device()
+            results.append(result)
+        
+        threads = [threading.Thread(target=query_device) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        
+        # All threads should get the same result
+        assert all(r == results[0] for r in results)
+        assert len(results) == 5
+    
+    def test_graceful_degradation_on_partial_device_info(self):
+        """Tests handling of devices with missing fields."""
+        incomplete_devices = [
+            {
+                'name': 'Incomplete Device',
+                'index': 0,
+                'max_input_channels': 2,
+                'max_output_channels': 0,
+                # missing default_samplerate
+            }
+        ]
+        
+        with patch('sounddevice.query_devices', return_value=MockDeviceList(incomplete_devices)):
+            try:
+                devices = VirtualAudioConfig.list_all_audio_devices()
+                # Should handle KeyError gracefully
+            except KeyError:
+                pytest.fail("Should handle missing device fields gracefully")

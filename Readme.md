@@ -512,6 +512,3 @@ black app/
 - ✅ Speech-to-text transcription
 - ✅ MongoDB session management
 
----
-
-**Built with ❤️ using Google Gemini, FastAPI, and Python**

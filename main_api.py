@@ -1,5 +1,6 @@
 # main_api.py
 import logging
+import urllib3
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Header
 from typing import Optional, Any, Dict, List
 import uvicorn
@@ -26,6 +27,7 @@ from app.core.log_config import setup_logging
 setup_logging()
 logger = logging.getLogger(__name__)
 
+logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 # --- Initialize FastAPI App ---
 app = FastAPI( title="AI Interviewer API", description="Conducts interviews and provides combined analysis." )
 
@@ -283,7 +285,10 @@ async def start_google_meet_interview(
 async def get_interview_status(session_id: str) -> Dict[str, Any]:
     if db_handler is None or meet_session_mgr is None: raise HTTPException(status_code=503, detail="Services offline.")
     session_data = db_handler.get_session(session_id)
-    if not session_data: raise HTTPException(status_code=44, detail="Session not found.")
+    # --- FIX ---
+    # Changed status_code from 44 to 404
+    if not session_data: raise HTTPException(status_code=404, detail="Session not found.")
+    # --- END FIX ---
     
     active_session = meet_session_mgr.get_session(session_id)
     bot_status = "ended_or_unknown"; video_enabled = False; video_capture_method = "unknown"; snapshot_count = 0; capture_stats = None

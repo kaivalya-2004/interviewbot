@@ -21,7 +21,6 @@ from app.services.meet_controller import MeetController # Import MeetController 
 logger = logging.getLogger(__name__)
 
 ESTIMATED_TURN_DURATION_SECONDS = 90
-# --- Tab monitoring constants REMOVED ---
 
 class MeetInterviewOrchestrator:
     """
@@ -37,6 +36,14 @@ class MeetInterviewOrchestrator:
         self.session_mgr = session_manager
         self.interview_svc = interview_service
         self.speech_client = speech.SpeechClient() 
+        
+        # --- START OF NEW CODE ---
+        # Keywords to detect non-answers
+        self.NON_ANSWER_KEYWORDS = [
+            "pardon", "repeat", "sorry", "what", 
+            "didn't hear", "could you say", "didn't catch"
+        ]
+        # --- END OF NEW CODE ---
         
         # --- Manually find audio devices ---
         self.BOT_PLAYBACK_DEVICE_NAME = "CABLE Input (VB-Audio Virtual Cable)" 
@@ -65,19 +72,18 @@ class MeetInterviewOrchestrator:
             self.virtual_output = None
             self.virtual_input = None
 
-    # --- _monitor_tab_switching method REMOVED ---
-
     async def conduct_interview(
         self,
         session_id: str,
         interview_duration_minutes: int = 10,
-        max_questions: int = 10, 
+        # --- MODIFICATION: max_questions parameter removed ---
     ) -> Dict[str, Any]:
         """
         Conducts interview asynchronously, prioritizing duration,
         checking for >2 participants, and handling candidate drops.
         """
-        logger.info(f"🎤 Starting ASYNC interview orchestration for session: {session_id} (Duration: {interview_duration_minutes} mins, Max Qs: {max_questions})")
+        # --- MODIFICATION: Removed max_questions from log ---
+        logger.info(f"🎤 Starting ASYNC interview orchestration for session: {session_id} (Duration: {interview_duration_minutes} mins)")
         interview_duration_seconds = interview_duration_minutes * 60
 
         session = self.session_mgr.get_session(session_id)
@@ -91,23 +97,19 @@ class MeetInterviewOrchestrator:
         
         session['termination_reason'] = None
         
-        # --- monitor_task REMOVED ---
         start_time = time.time() 
         transcript = [] 
         questions_asked_count = 0 
         
         try: 
-            # --- monitor_task creation REMOVED ---
-
-            # --- Video ratio pre-check REMOVED ---
-
             logger.info("Proceeding with interview start.")
             await asyncio.sleep(1) 
 
             turn_count = 1 
 
             # --- Ask Initial Greeting & Handle Intro ---
-            initial_greeting = self.interview_svc.generate_initial_greeting()
+            # --- MODIFICATION: Pass session_id to get candidate name ---
+            initial_greeting = self.interview_svc.generate_initial_greeting(session_id)
             logger.info(f"🤖 Bot: {initial_greeting}")
             
             await asyncio.to_thread(meet.enable_microphone); await asyncio.sleep(0.5)
@@ -137,43 +139,56 @@ class MeetInterviewOrchestrator:
                 if not rejoined: 
                     if stop_event and stop_event.is_set(): logger.info("Manually terminated during rejoin wait.")
                     else: logger.error(f"❌ Candidate did not rejoin. Terminating.");
-                    if stop_event: stop_event.set(); session['termination_reason'] = "candidate_left";
+                    # --- FIX: Changed break to playback_ok = False ---
+                    if stop_event: stop_event.set(); session['termination_reason'] = "candidate_left"
+                    playback_ok = False # This skips the intro and while loop
+                    # --- END FIX ---
                 else:
                     playback_ok = True 
             
             await asyncio.sleep(0.5)
 
+            # --- MODIFICATION: Handle intro response logic here ---
             intro_text = "[Recording skipped due to early exit]"
             if playback_ok and not (stop_event and stop_event.is_set()): 
                 logger.info("🎤 Listening for candidate's introduction...")
                 
-                rec_start_time = await asyncio.to_thread(
+                # 1. Record audio and get transcript
+                rec_start_time, intro_text = await asyncio.to_thread(
                     self._record_and_process_stt_streaming_manual_vad, 
                     session_id, turn_count, candidate_id, 
+                    is_follow_up=False
+                )
+                rec_end_time = datetime.now()
+                audio_path_stt = self._get_user_audio_path_for_stt(
+                    session_id, turn_count, candidate_id, 
+                    is_follow_up=False
+                )
+                
+                # 2. Log this first response (we accept any intro)
+                self.interview_svc.process_and_log_transcript(
+                    session_id, str(audio_path_stt), intro_text,
+                    turn_count, candidate_id,
+                    rec_start_time, rec_end_time,
                     is_follow_up_response=False
                 )
 
-                intro_turn = turn_count
                 turn_count += 1
                 logger.info("Disabling mic after intro..."); 
                 await asyncio.to_thread(meet.disable_microphone); logger.info("Mic disabled.")
             
             if stop_event and stop_event.is_set():
                  logger.info("Stop signal detected after intro recording. Ending early.")
-                 try: self.interview_svc.generate_final_transcript_file(session_id)
-                 except Exception as e: logger.error(f"Failed to generate final transcript after early exit: {e}")
-                 return {"status": "terminated", "session_id": session_id, "final_transcript_summary": transcript}
+                 playback_ok = False # Skip main loop
 
-            await asyncio.sleep(0.1) 
-            with self.interview_svc._transcript_lock:
-                    intro_text = self.interview_svc._latest_transcript_for_gemini.get(session_id, "[Transcript not updated after intro]")
-
-            if intro_text and not intro_text.startswith("[Error") and intro_text != "[Unintelligible]" and intro_text != "[No response]" and intro_text != "[Recording cancelled]" and intro_text != "[Transcript not updated after intro]":
+            # 3. Add to local transcript
+            if intro_text and not intro_text.startswith("[Error") and intro_text != "[Unintelligible]" and intro_text != "[No response]" and intro_text != "[Recording cancelled]":
                 logger.info(f"👤 Candidate Intro: {intro_text}")
                 transcript.append({"role": "user", "content": intro_text, "is_follow_up": False})
             else:
                  logger.warning(f"Could not cleanly capture intro: {intro_text}")
                  transcript.append({"role": "user", "content": intro_text or "[Introduction Unclear]", "is_follow_up": False})
+            # --- END OF INTRO MODIFICATION ---
 
 
             # --- Main Interview Loop (Prioritizes Time) ---
@@ -183,9 +198,13 @@ class MeetInterviewOrchestrator:
 
                 # Primary Termination Checks
                 if stop_event and stop_event.is_set(): logger.info("Termination signal received."); break
-                if questions_asked_count >= max_questions: logger.info(f"Max questions ({max_questions}) reached."); break
+                
+                # --- MODIFICATION: Removed max_questions check ---
+                
                 if remaining_time < ESTIMATED_TURN_DURATION_SECONDS and questions_asked_count > 0:
-                    logger.info(f"Time limit approaching ({remaining_time:.0f}s left)."); break
+                    logger.info(f"Time limit approaching ({remaining_time:.0f}s left)."); 
+                    session['termination_reason'] = "time_limit_reached"; # Set reason before break
+                    break
 
                 # Participant Count Check
                 try:
@@ -193,7 +212,9 @@ class MeetInterviewOrchestrator:
                     
                     if current_participant_count > 2:
                         logger.error(f"❌ Participant count increased to {current_participant_count}. Terminating.")
-                        if stop_event: stop_event.set()
+                        # --- START OF FIX ---
+                        # DO NOT set stop_event yet, play audio first
+                        # if stop_event: stop_event.set() # <--- MOVED
                         session['termination_reason'] = "multiple_participants"
                         
                         termination_msg = ("It appears there are extra participants in the call. "
@@ -205,11 +226,16 @@ class MeetInterviewOrchestrator:
                              termination_msg, session_id, turn_count, candidate_id 
                         )
                         if term_audio_stream: 
+                            # This will now play because stop_event is not set
                             await asyncio.to_thread(
                                 self._play_audio_stream, term_audio_stream, meet, stop_event
                             )
                         await asyncio.sleep(0.5); await asyncio.to_thread(meet.disable_microphone)
+                        
+                        # Now set the stop_event and break
+                        if stop_event: stop_event.set()
                         break
+                        # --- END OF FIX ---
 
                     elif current_participant_count < 2:
                         logger.warning(f"⚠️ Participant count dropped to {current_participant_count}. Waiting 2 minutes to rejoin...")
@@ -229,16 +255,19 @@ class MeetInterviewOrchestrator:
                 
                 if stop_event and stop_event.is_set(): logger.info("Stop signal after STT wait."); break
 
-                logger.info(f"\n--- Generating Question {questions_asked_count + 1}/{max_questions} ---")
+                # --- MODIFICATION: Removed max_questions from log ---
+                logger.info(f"\n--- Generating Question {questions_asked_count + 1} ---")
+                
+                # --- MODIFICATION: Store turn_count *before* incrementing ---
+                current_question_turn = turn_count
+                turn_count += 1
+                questions_asked_count += 1
 
                 await asyncio.to_thread(meet.enable_microphone); await asyncio.sleep(0.5)
                 
                 audio_stream_generator = self.interview_svc.stream_interview_turn(
-                    session_id, turn_count, candidate_id
+                    session_id, current_question_turn, candidate_id # Use current_question_turn
                 )
-                current_turn = turn_count 
-                turn_count += 1
-                questions_asked_count += 1
                 
                 playback_ok = True 
                 if audio_stream_generator:
@@ -266,8 +295,10 @@ class MeetInterviewOrchestrator:
                         if stop_event: stop_event.set(); session['termination_reason'] = "candidate_left";
                         break 
                      else:
+                        # --- MODIFICATION: Decrement counters to repeat turn ---
                         questions_asked_count -= 1 
                         turn_count -= 1 
+                        # --- END MODIFICATION ---
                         playback_ok = True 
                         continue 
                 
@@ -276,18 +307,68 @@ class MeetInterviewOrchestrator:
                 # Record response & start background processing
                 logger.info("🎤 Listening..."); 
                 
-                rec_start_time = await asyncio.to_thread(
-                    self._record_and_process_stt_streaming_manual_vad, 
-                    session_id, turn_count, candidate_id,
-                    is_follow_up_response=False
-                )
-
-                current_turn = turn_count 
+                # --- MODIFICATION: Get transcript back from function ---
+                current_response_turn = turn_count # This is the *response* turn number
                 turn_count += 1
+                
+                rec_start_time, transcript_text = await asyncio.to_thread(
+                    self._record_and_process_stt_streaming_manual_vad, 
+                    session_id, current_response_turn, candidate_id,
+                    is_follow_up=False
+                )
+                rec_end_time = datetime.now()
+                audio_path_stt = self._get_user_audio_path_for_stt(
+                    session_id, current_response_turn, candidate_id,
+                    is_follow_up=False
+                )
+                # --- END MODIFICATION ---
+
                 logger.info("Disabling mic..."); 
                 await asyncio.to_thread(meet.disable_microphone); logger.info("Mic disabled.")
                 if stop_event and stop_event.is_set(): logger.info("Stop signal after starting STT."); break
-                transcript.append({"role": "user", "content": "[Processing Response...]", "turn": current_turn})
+                
+                # --- START OF NEW LOGIC (Step 3) ---
+                transcript_text_lower = transcript_text.lower()
+                is_non_answer = any(keyword in transcript_text_lower for keyword in self.NON_ANSWER_KEYWORDS)
+                
+                # Also check for very short, likely non-answers (e.g., "yes", "no", "ok")
+                if not is_non_answer and len(transcript_text) < 5:
+                     logger.info(f"Short response detected ('{transcript_text}'), treating as non-answer.")
+                     is_non_answer = True
+                
+                if is_non_answer:
+                    logger.warning(f"Candidate non-answer detected: '{transcript_text}'. Repeating last question.")
+                    # Log to DB but do NOT update Gemini state
+                    self.interview_svc.db.add_message_to_session(
+                        session_id, "user", transcript_text, str(audio_path_stt), 
+                        rec_start_time, rec_end_time
+                    )
+                    
+                    await asyncio.to_thread(meet.enable_microphone); await asyncio.sleep(0.5)
+                    repeat_audio_stream = self.interview_svc.stream_plain_text(
+                         "Sorry, I'll repeat that.", session_id, f"repeat_{current_response_turn}", candidate_id 
+                    )
+                    if repeat_audio_stream:
+                        await asyncio.to_thread(self._play_audio_stream, repeat_audio_stream, meet, stop_event)
+                    await asyncio.to_thread(meet.disable_microphone)
+                    
+                    # Decrement counters to repeat the turn
+                    questions_asked_count -= 1
+                    turn_count -= 2 # Decrement by 2 to offset both increments
+                    
+                    # This continues to the top of the while loop, re-running the *same* question
+                    continue 
+                else:
+                    # This is a valid answer. Log it and update Gemini state.
+                    self.interview_svc.process_and_log_transcript(
+                        session_id, str(audio_path_stt), transcript_text,
+                        current_response_turn, candidate_id,
+                        rec_start_time, rec_end_time,
+                        is_follow_up_response=False
+                    )
+                    transcript.append({"role": "user", "content": transcript_text, "turn": current_response_turn})
+                # --- END OF NEW LOGIC ---
+
                 await asyncio.sleep(0.5)
 
             # --- End of Loop ---
@@ -298,8 +379,6 @@ class MeetInterviewOrchestrator:
             if stop_event: stop_event.set() # Ensure cleanup
         
         finally:
-            # --- monitor_task cleanup REMOVED ---
-
             logger.info("Final STT work already completed in loop.")
 
             # Closing statement
@@ -314,11 +393,13 @@ class MeetInterviewOrchestrator:
                  if termination_reason == "multiple_participants": closing_reason = "Multiple participants were detected."
                  elif termination_reason == "candidate_left": closing_reason = "The candidate left the meeting."
                  else: closing_reason = "The interview was ended early."
-            elif questions_asked_count >= max_questions: closing_reason = "We have reached the end of the interview."
+            
+            # --- MODIFICATION: Removed max_questions check ---
+            
             elif 'remaining_time' in locals() and not (remaining_time < ESTIMATED_TURN_DURATION_SECONDS or final_elapsed >= interview_duration_seconds):
                  closing_reason = "We have completed the interview."
             elif final_elapsed >= interview_duration_seconds:
-                 closing_reason = "Allocated time is up."
+                 closing_reason = "Allocated time is up." # Corrected from "closing_warning"
             elif questions_asked_count == 0 and not termination_reason:
                 closing_reason = "Interview did not start."
 
@@ -340,8 +421,6 @@ class MeetInterviewOrchestrator:
                  
                  await asyncio.sleep(0.5); await asyncio.to_thread(meet.disable_microphone)
 
-            # --- Tab switch DB save REMOVED ---
-
             try: self.interview_svc.generate_final_transcript_file(session_id)
             except Exception as e: logger.error(f"Failed generate final transcript: {e}")
 
@@ -349,13 +428,14 @@ class MeetInterviewOrchestrator:
 
         final_status = "unknown"
         if stop_event and stop_event.is_set(): 
-            final_status = session.get('termination_reason', 'terminated')
-        elif 'remaining_time' in locals() and remaining_time < ESTIMATED_TURN_DURATION_SECONDS: 
+            final_status = session.get('termination_reason') or 'terminated'
+        elif 'remaining_time' in locals() and remaining_time < ESTIMATED_TURN_DURATION_SECONDS and questions_asked_count > 0: 
             final_status = "time_limit_reached"
         elif final_elapsed >= interview_duration_seconds : 
             final_status = "time_limit_reached"
-        elif questions_asked_count >= max_questions: 
-            final_status = "max_questions_reached"
+        
+        # --- MODIFICATION: Removed max_questions check ---
+        
         else: 
             final_status = "completed"
 
@@ -474,39 +554,42 @@ class MeetInterviewOrchestrator:
         
         return path_24k_stt
     
+    # --- MODIFICATION: This function now returns the transcript ---
     def _record_and_process_stt_streaming_manual_vad(
         self,
         session_id: str,
         turn_count: int,
         candidate_id: str,
-        is_follow_up_response: bool = False
-    ) -> Optional[datetime]:
+        is_follow_up: bool = False
+    ) -> Tuple[Optional[datetime], str]:
         """
         Records audio using a manual 2-second VAD, while simultaneously
-        streaming to Google STT to eliminate post-processing lag.
-        This is a SYNCHRONOUS, BLOCKING function meant to be run in a thread.
+        streaming to Google STT.
+        Returns the (start_time, final_transcript_string).
         """
         
-        audio_queue = queue.Queue() # For sending audio to Google STT
-        recorded_chunks = [] # For saving the final .wav file
+        audio_queue = queue.Queue() 
+        recorded_chunks = [] 
         recording_start_time = None
         stream = None
         stt_thread = None
-        final_transcript = "[Unintelligible]" # Default
+        final_transcript = "[Unintelligible]" 
         
         try:
             session = self.session_mgr.get_session(session_id);
-            if not session: logger.warning(f"Session {session_id} ended."); return None
+            if not session: 
+                logger.warning(f"Session {session_id} ended."); 
+                return None, "[Error]"
             stop_event = session.get('stop_interview')
-            if stop_event and stop_event.is_set(): logger.info("Stop signal before recording."); return None
+            if stop_event and stop_event.is_set(): 
+                logger.info("Stop signal before recording."); 
+                return None, "[Error]"
             
             input_device = self.virtual_input if self.virtual_input is not None else sd.default.device[0]
-            samplerate = self.target_samplerate # 24000
+            samplerate = self.target_samplerate 
             
             def audio_callback(indata, frames, time, status):
-                """Feeds the STT queue and the file-saving list."""
                 if status: logger.warning(f"SD status: {status}")
-                # Convert float32 to int16 bytes for Google STT
                 audio_bytes = (indata * 32767).astype(np.int16).tobytes()
                 audio_queue.put(audio_bytes)
                 recorded_chunks.append(indata.copy())
@@ -519,7 +602,6 @@ class MeetInterviewOrchestrator:
                 dtype='float32' 
             )
 
-            # --- STT Request Generator (pulls from queue) ---
             def request_generator():
                 try:
                     while True:
@@ -530,18 +612,15 @@ class MeetInterviewOrchestrator:
                 except Exception as e:
                     logger.error(f"STT request_generator error: {e}")
             
-            # --- STT Config (NO single_utterance) ---
             config = speech.RecognitionConfig(
                 encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
                 sample_rate_hertz=samplerate,
-                language_code="en-US", 
+                language_code="en-IN", 
                 enable_automatic_punctuation=True
             )
             streaming_config = speech.StreamingRecognitionConfig(config=config)
 
-            # --- STT Processing Thread ---
             def stt_processor_thread():
-                """This thread just listens for Google STT results."""
                 nonlocal final_transcript
                 try:
                     api_requests = request_generator()
@@ -552,7 +631,6 @@ class MeetInterviewOrchestrator:
                     
                     for response in responses:
                         if response.results and response.results[0].is_final:
-                            # We update this every time we get a final result
                             final_transcript = response.results[0].alternatives[0].transcript
                             logger.info(f"STT (final interim): '{final_transcript}'")
                 
@@ -560,7 +638,6 @@ class MeetInterviewOrchestrator:
                     logger.error(f"Google STT streaming error: {e}", exc_info=True)
                     final_transcript = "[Speech service error]"
 
-            # --- Start Recording and STT Thread ---
             logger.info(f"🎙️ Streaming recording from {input_device} @ {samplerate}Hz (Manual VAD 2.0s)...")
             stream.start()
             recording_start_time = datetime.now()
@@ -568,7 +645,6 @@ class MeetInterviewOrchestrator:
             stt_thread = threading.Thread(target=stt_processor_thread, daemon=True)
             stt_thread.start()
 
-            # --- Manual VAD Loop ---
             silence_threshold_seconds = 2.0
             silence_start_time = None
             min_speech_duration = 0.5; speech_start_time = None; volume_threshold = 0.005
@@ -579,8 +655,7 @@ class MeetInterviewOrchestrator:
                 stop_event = session.get('stop_interview')
                 if stop_event and stop_event.is_set(): logger.info("Stop signal during VAD."); break
                 
-                # Check recent audio volume
-                if len(recorded_chunks) > 10: # Check last ~second of audio
+                if len(recorded_chunks) > 10: 
                     recent_audio = np.concatenate(recorded_chunks[-10:], axis=0)
                     volume = np.sqrt(np.mean(recent_audio**2))
                     
@@ -595,60 +670,56 @@ class MeetInterviewOrchestrator:
                             logger.info(f"🔇 Manual VAD detected 2.0s silence. Stopping."); 
                             break
                 
-                # Check for max duration
                 elapsed = (datetime.now() - recording_start_time).total_seconds()
-                if elapsed >= 120: # 2-minute max
+                if elapsed >= 120: 
                     logger.info(f"⏱️ Max duration (120s) reached."); 
                     break
                 
-                time.sleep(0.1) # Check VAD every 100ms
+                time.sleep(0.1) 
 
-            # --- Stop everything ---
             logger.debug("Stopping stream..."); 
             stream.stop(); stream.close(); 
             logger.debug("Stream stopped/closed.")
             
-            # Signal STT thread to end
             audio_queue.put(None) 
             logger.debug("Waiting for STT thread to join...")
-            stt_thread.join(timeout=5) # Wait for STT to finish
+            stt_thread.join(timeout=5) 
             if stt_thread.is_alive():
                 logger.error("STT thread timed out.")
 
             logger.info(f"Final STT result: '{final_transcript}'")
 
-            # --- Save the full audio file ---
             if recorded_chunks:
                 recording_data = np.concatenate(recorded_chunks, axis=0)
-                recording_end_time = datetime.now()
+                # recording_end_time = datetime.now() # Moved to main loop
                 logger.info(f"Recording finished. Duration: {len(recording_data)/samplerate:.2f}s")
                 
                 audio_path_stt = self._get_user_audio_path_for_stt(
-                    session_id, turn_count, candidate_id, is_follow_up_response
+                    session_id, turn_count, candidate_id, 
+                    is_follow_up
                 )
                 
                 try:
                     sf.write(str(audio_path_stt), recording_data.flatten(), samplerate, format='WAV', subtype='PCM_16')
                     logger.info(f"💾 (Stream) 24k recording saved: {audio_path_stt}")
                     
-                    # --- Log the final transcript ---
-                    self.interview_svc.process_and_log_transcript(
-                        session_id, str(audio_path_stt), final_transcript,
-                        turn_count, candidate_id,
-                        recording_start_time, recording_end_time,
-                        is_follow_up_response
-                    )
+                    # --- MODIFICATION: REMOVED process_and_log_transcript call ---
+                    # This is now handled in the main conduct_interview loop
+                    
                 except Exception as save_e:
-                    logger.error(f"Failed to save/log streamed audio: {save_e}", exc_info=True)
+                    logger.error(f"Failed to save streamed audio: {save_e}", exc_info=True)
             
             else:
                 logger.warning("No audio data recorded.")
 
-            return recording_start_time
+            return recording_start_time, final_transcript
 
-        except sd.PortAudioError as pae: logger.error(f"❌ PortAudioError: {pae}"); return None
+        except sd.PortAudioError as pae: 
+            logger.error(f"❌ PortAudioError: {pae}"); 
+            return None, "[Error]"
         except Exception as e: 
-            logger.error(f"❌ Error in streaming record: {e}", exc_info=True); return None
+            logger.error(f"❌ Error in streaming record: {e}", exc_info=True); 
+            return None, "[Error]"
         finally:
              if stream and not stream.closed:
                   try: stream.abort(ignore_errors=True); stream.close(); logger.debug("Stream closed finally.")

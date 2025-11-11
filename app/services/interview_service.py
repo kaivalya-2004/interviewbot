@@ -1,6 +1,9 @@
 # app/services/interview_service.py
 import os
 import google.generativeai as genai
+# --- START OF FIX ---
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
+# --- END OF FIX ---
 from dotenv import load_dotenv
 import logging
 from datetime import datetime
@@ -24,6 +27,8 @@ class InterviewService:
     def __init__(self):
         self.db = DBHandler()
         self.active_chat_sessions: Dict[str, Any] = {}
+        # --- MODIFICATION: Added state to store extracted names ---
+        self.candidate_names: Dict[str, str] = {}
         self._session_token_counts = defaultdict(lambda: {'prompt': 0, 'response': 0, 'total': 0})
         self._session_tts_char_counts = defaultdict(int)
         self._latest_transcript_for_gemini: Dict[str, Optional[str]] = {}
@@ -39,11 +44,23 @@ class InterviewService:
                 temperature=0.0,
                 top_k=1
             )
+            
+            # --- START OF FIX ---
+            # Set safety settings to be permissive to avoid stream-closing blocks
+            safety_settings = {
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+            }
+            # --- END OF FIX ---
+
             self.model = genai.GenerativeModel(
                 'gemini-2.5-flash',
-                generation_config=generation_config
+                generation_config=generation_config,
+                safety_settings=safety_settings  # Add this line
             ) 
-            logger.info("✅ Gemini API configured (Temp=0.0, Top_K=1).")
+            logger.info("✅ Gemini API configured (Temp=0.0, Top_K=1, Safety=BLOCK_NONE).")
             
         except Exception as e:
             logger.error(f"❌ Failed to configure Gemini API: {e}")
@@ -70,6 +87,26 @@ class InterviewService:
     def start_new_interview(self, resume_text: str, candidate_id: str, questionnaire: List[str]) -> str:
         """Initializes Gemini chat and all tracking."""
         session_id = self.db.create_session(resume_text, candidate_id, questionnaire or [])
+        
+        # --- START OF MODIFICATION ---
+        # Attempt to extract candidate name from resume
+        extracted_name = "Candidate" # Default
+        try:
+            # Try a simple regex for "Name: [Name]" or "Name [Name]"
+            match = re.search(r"Name\s*[:\s-]\s*([A-Za-z]+\s+[A-Za-z]+)", resume_text, re.IGNORECASE)
+            if match:
+                extracted_name = match.group(1).title()
+            else:
+                # Try to grab the first two words if they look like a name (e.g., at the very top)
+                match_top = re.search(r"^\s*([A-Za-z]{2,}\s+[A-Za-z]{2,})\s*", resume_text)
+                if match_top:
+                    extracted_name = match_top.group(1).title()
+            logger.info(f"Extracted name for session {session_id}: {extracted_name}")
+        except Exception as e:
+            logger.warning(f"Could not extract name from resume: {e}")
+        
+        self.candidate_names[session_id] = extracted_name
+        # --- END OF MODIFICATION ---
         
         if not self.model: 
             raise RuntimeError("Gemini chat model failed.")
@@ -136,18 +173,30 @@ Your primary goal is to conduct a **broad, high-level screening** of the candida
             with self._transcript_lock:
                  if session_id in self._latest_transcript_for_gemini: 
                      del self._latest_transcript_for_gemini[session_id]
+            # --- MODIFICATION: Cleanup name if chat init fails ---
+            if session_id in self.candidate_names:
+                del self.candidate_names[session_id]
             logger.error(f"❌ Failed init Gemini chat: {e}", exc_info=True)
             raise RuntimeError(f"Failed start Gemini: {e}")
             
         return session_id
 
-    def generate_initial_greeting(self) -> str:
-        """Provides the opening greeting with instructions."""
+    # --- MODIFICATION: Added session_id parameter and updated text ---
+    def generate_initial_greeting(self, session_id: str) -> str:
+        """Provides the opening greeting with instructions and name verification."""
+        name = self.candidate_names.get(session_id, "Candidate")
+        
+        if name == "Candidate":
+            greeting_name_part = "To start, could you please state your full name,"
+        else:
+            greeting_name_part = f"Just to confirm, are you {name}?"
+        
         return ("Hello and welcome. I am your Interviewer for today. "
                 "For our session today, please ensure your camera is turned on and remains on throughout the interview. "
                 "Also, please make sure your microphone is enabled when you are speaking. "
-                "Let's get started. "
-                "Please introduce yourself.")
+                f"{greeting_name_part} "
+                "And after that, please introduce yourself.")
+    # --- END MODIFICATION ---
 
     def _save_audio_thread(self, audio_data: np.ndarray, sample_rate: int, audio_path: str, session_id: str, text: str, is_follow_up: bool):
         try: 
@@ -463,6 +512,12 @@ Your primary goal is to conduct a **broad, high-level screening** of the candida
 
     def end_interview_session(self, session_id: str):
         """Logs totals and clears session state from memory."""
+        # --- MODIFICATION: Cleanup candidate name ---
+        if session_id in self.candidate_names:
+            del self.candidate_names[session_id]
+            logger.info(f"Cleared candidate name for {session_id}")
+        # --- END MODIFICATION ---
+
         if session_id in self._session_token_counts:
             totals = self._session_token_counts[session_id]
             logger.info(f"--- Total Interview Chat Tokens (Session: {session_id}) ---")

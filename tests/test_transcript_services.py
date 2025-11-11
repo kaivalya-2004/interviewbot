@@ -1,6 +1,6 @@
 # tests/test_transcript_services.py
 import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, MagicMock
 import json
 import os # Import os to patch.dict
 import sys # Import sys to fix path
@@ -92,10 +92,11 @@ class TestTranscriptParser:
         assert result['metadata']['user_id'] == 'candidate_001'
         assert len(result['qa_pairs']) > 0
 
-    def test_parse_empty_transcript(self):
-        """Test parsing empty transcript"""
-        with pytest.raises(ValueError):
-            TranscriptParser.parse("")
+    @pytest.mark.parametrize("content", ["", "   \n   "])
+    def test_parse_empty_or_whitespace_transcript(self, content):
+        """Test parsing empty or whitespace-only transcript"""
+        with pytest.raises(ValueError, match="Transcript content is empty."):
+            TranscriptParser.parse(content)
 
     def test_extract_metadata(self, sample_transcript):
         """Test metadata extraction"""
@@ -238,13 +239,19 @@ class TestTranscriptAnalyzer:
     @pytest.fixture
     def transcript_analyzer(self, mock_gemini):
         """Create TranscriptAnalyzer with mocked Gemini"""
-        with patch('app.services.transcript_analyzer.GEMINI_API_KEY', 'fake-api-key'):
+        # --- FIX: Patch the module-level variables directly ---
+        with patch('app.services.transcript_analyzer.GEMINI_API_KEY', 'fake-api-key'), \
+             patch('app.services.transcript_analyzer.TRANSCRIPT_ANALYSIS_MODEL_NAME', 'gemini-test-pro'):
             analyzer = TranscriptAnalyzer()
             return analyzer
+        # --- END FIX ---
 
-    def test_initialization(self, transcript_analyzer):
+    def test_initialization(self, transcript_analyzer, mock_gemini):
         """Test analyzer initializes correctly"""
         assert transcript_analyzer.model is not None
+        # Check that it used the (mocked) env var model name
+        mock_gemini.GenerativeModel.assert_called_with('gemini-test-pro')
+
 
     def test_analyze_success(self, transcript_analyzer, sample_resume, sample_transcript):
         """Test successful transcript analysis"""
@@ -273,16 +280,17 @@ class TestTranscriptAnalyzer:
             'qa_pairs': []
         }
         
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="Cannot analyze transcript without Q&A pairs"):
             transcript_analyzer.analyze(sample_resume, invalid_transcript)
 
     def test_analyze_invalid_response_format(self, transcript_analyzer, sample_resume, sample_transcript, mock_gemini):
-        """Test handling of invalid API response format"""
+        """Test handling of invalid API response format (not JSON)"""
         mock_gemini.GenerativeModel().generate_content.return_value.text = "Not valid JSON"
         
         parsed = TranscriptParser.parse(sample_transcript)
         
-        with pytest.raises(ValueError):
+        # Should fail in _clean_response
+        with pytest.raises(ValueError, match="AI response did not contain a valid JSON object"):
             transcript_analyzer.analyze(sample_resume, parsed)
 
     def test_analyze_missing_required_keys(self, transcript_analyzer, sample_resume, sample_transcript, mock_gemini):
@@ -290,11 +298,12 @@ class TestTranscriptAnalyzer:
         mock_gemini.GenerativeModel().generate_content.return_value.text = json.dumps({
             "session_id": "test",
             "overall_summary": "Test"
+            # Missing "strengths", "weaknesses", "overall_score", etc.
         })
         
         parsed = TranscriptParser.parse(sample_transcript)
         
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="missing required keys"):
             transcript_analyzer.analyze(sample_resume, parsed)
 
     def test_create_analysis_prompt(self, transcript_analyzer, sample_resume, sample_transcript):
@@ -343,11 +352,11 @@ class TestTranscriptAnalyzer:
         """Test cleaning response with no valid JSON"""
         response_no_json = "This is just text without JSON"
         
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="did not contain a valid JSON"):
             transcript_analyzer._clean_response(response_no_json)
 
     def test_score_validation(self, transcript_analyzer, sample_resume, sample_transcript, mock_gemini):
-        """Test that scores are validated to be in range"""
+        """Test that scores are validated to be in range (Pydantic)"""
         invalid_scores = {
             "session_id": "test_session_123",
             "user_id": "candidate_001",
@@ -380,6 +389,8 @@ class TestTranscriptAnalyzer:
             info_calls = [call for call in mock_logger.info.call_args_list]
             token_logged = any('Token' in str(call) for call in info_calls)
             assert token_logged
+            # Check for the specific log
+            assert any('Gemini Transcript Analysis Tokens' in str(call) for call in info_calls)
 
     @pytest.mark.parametrize("answer_quality", ["Excellent", "Good", "Fair", "Poor"])
     def test_answer_quality_levels(self, transcript_analyzer, sample_resume, mock_gemini, answer_quality):

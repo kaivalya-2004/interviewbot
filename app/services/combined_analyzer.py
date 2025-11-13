@@ -29,7 +29,7 @@ class CombinedAnalyzer:
             
             genai.configure(api_key=api_key)
             # Use the model specified for vision analysis
-            self.model = genai.GenerativeModel('models/gemini-2.5-flash') 
+            self.model = genai.GenerativeModel('models/gemini-2.5-pro') 
             logger.info("✅ CombinedAnalyzer initialized (Gemini model loaded)")
             
         except Exception as e:

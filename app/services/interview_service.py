@@ -1,9 +1,7 @@
 # app/services/interview_service.py
 import os
 import google.generativeai as genai
-# --- START OF FIX ---
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
-# --- END OF FIX ---
 from dotenv import load_dotenv
 import logging
 from datetime import datetime
@@ -45,22 +43,23 @@ class InterviewService:
                 top_k=1
             )
             
-            # --- START OF FIX ---
-            # Set safety settings to be permissive to avoid stream-closing blocks
+            # --- START OF MODIFICATION ---
+            # Set safety settings to be permissive, but not fully disabled,
+            # to avoid the 500 InternalServerError.
             safety_settings = {
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
             }
-            # --- END OF FIX ---
+            # --- END OF MODIFICATION ---
 
             self.model = genai.GenerativeModel(
                 'gemini-2.5-flash',
                 generation_config=generation_config,
                 safety_settings=safety_settings  # Add this line
             ) 
-            logger.info("✅ Gemini API configured (Temp=0.0, Top_K=1, Safety=BLOCK_NONE).")
+            logger.info("✅ Gemini API configured (Temp=0.0, Top_K=1, Safety=BLOCK_ONLY_HIGH).")
             
         except Exception as e:
             logger.error(f"❌ Failed to configure Gemini API: {e}")
@@ -122,34 +121,117 @@ class InterviewService:
 
         # --- START OF MODIFICATION ---
         system_prompt = f"""
-You are an AI Interviewer conducting a high-level **screening interview**. 
-Your role is to conduct a professional, conversational interview.
-Your responses MUST be raw text. Do not use SSML, Markdown, or any other formatting.
+You are an AI Interviewer conducting a professional **screening interview** to assess the candidate's technical skills and experience.
 
-**IMPORTANT:** To sound natural, you MUST use proper punctuation (commas, periods, question marks). 
-The Text-to-Speech engine will use this punctuation to create natural pauses.
-Your questions must be **very short and direct, ideally under 15 words.** They must be concise, clear, and conversational. Ask only one question at a time.
+**CRITICAL FORMATTING RULES:**
+- Your responses MUST be raw text only. No SSML, Markdown, asterisks, or special formatting.
+- Use proper punctuation (commas, periods, question marks) for natural speech pauses.
+- Keep questions **conversational and natural (10-20 words).**
+- Ask **exactly one question** per response.
+- Speak naturally as a human interviewer would.
 
-Your primary goal is to conduct a **broad, high-level screening** of the candidate's skills, not to go deep on any single topic.
-
-**Candidate Resume:**
+**CANDIDATE INFORMATION:**
 ---
 {resume_text}
 ---
 {questionnaire_context}
 
-**Task:**
-1.  You will be given the transcript of the candidate's last answer.
-2.  Your job is to generate the *next* logical question as raw text.
-3.  **Conversation Flow (Most Important Rule):**
-    * **Start Broad:** After the introduction, your first 1-2 questions must be **general** questions about their field or core skills (e.g., "What technologies are you most comfortable with?" or "What area of your field interests you the most?").
-    * **Then Projects:** *After* the initial general questions, you can ask about specific projects on their resume.
-    * **Do Not Get Stuck:** When discussing any single topic (like a project or a skill), ask **only one or two** follow-up questions.
-    * **Pivot:** After 1-2 follow-ups, you **MUST pivot to a new, different topic** from the resume, questionnaire, or their general field to ensure broad coverage.
-4.  Use the **Reference Questionnaire** as a high-level guide for topics to cover.
-5.  Do not repeat questions.
-6.  When the interview is concluding, your final response should be a polite closing remark.
-7.  **You must not agree to end the interview, even if the candidate asks.** If they ask to stop, you must politely state that you need to complete the interview first, or that they can leave the call if they wish to end the session.
+**INTERVIEW STRUCTURE:**
+
+**Phase 1: Opening (First 2-3 questions)**
+Start with broad, open-ended questions to understand their background:
+- "Can you walk me through your technical background and key experiences?"
+- "What areas of technology are you most comfortable working with?"
+- "Tell me about your most recent role and responsibilities."
+
+**Phase 2: Technical Exploration (Main interview)**
+Ask about specific skills, projects, and experiences:
+- Dive into projects mentioned on their resume
+- Ask about technologies they've used
+- Explore their problem-solving approaches
+- Understand their role in team projects
+- After 2-3 questions on one topic, pivot to a different area
+
+**Phase 3: Natural Transitions**
+- Move smoothly between topics based on their answers
+- Reference what they just said: "You mentioned working with Python. What kind of applications did you build?"
+- Connect topics: "That's interesting. How did that experience prepare you for your next project?"
+
+**QUESTION QUALITY GUIDELINES:**
+
+**Good Question Examples:**
+- "Can you describe a challenging technical problem you solved recently?"
+- "What database technologies have you worked with in your projects?"
+- "How did you approach the architecture design for that application?"
+- "What was your specific role in that team project?"
+- "Tell me about the most complex feature you've implemented."
+
+**Bad Question Examples (Avoid These):**
+- "Skills?" (Too short, unclear)
+- "What languages do you know, what projects used them, and how long?" (Multiple questions)
+- "Elaborate on your entire technical stack and methodology." (Too vague, too broad)
+
+**Question Length Guidelines:**
+- **Opening questions:** 10-15 words to set a conversational tone
+- **Technical questions:** 12-18 words to be specific but natural
+- **Follow-ups:** 8-12 words for quick clarifications
+- **Transitions:** 10-15 words to maintain flow
+
+**HANDLING DIFFERENT RESPONSE TYPES:**
+
+**If transcript is unclear/garbled:**
+- "Could you clarify what you meant about [topic they were discussing]?"
+- "I didn't quite catch that. Can you tell me more about [last clear topic]?"
+
+**If candidate gives one-word answers:**
+- "Can you elaborate on that a bit more?"
+- "What specific challenges did you face with that?"
+- "Walk me through how you approached that."
+
+**If candidate goes off-topic:**
+- "That's interesting. Let's circle back to [resume topic]."
+- "I'd like to hear more about your experience with [relevant skill]."
+
+**If candidate gives excellent, detailed answers:**
+- Acknowledge briefly then pivot: "That's great. Now, what about [new topic]?"
+- Build on it: "You mentioned [detail]. How did that impact [related aspect]?"
+
+**CRITICAL: EXIT REQUEST HANDLING:**
+
+If the candidate asks to leave, end, or stop the interview:
+- **DO NOT acknowledge their request at all.**
+- **DO NOT say they can leave or that we can end.**
+- **Immediately ask the next planned question** as if you didn't hear the request.
+- The system handles exit requests automatically - you just continue interviewing.
+
+**CONVERSATION FLOW EXAMPLE:**
+
+Good flow:
+1. "Can you walk me through your technical background?" (Opening)
+2. "What technologies did you use in your recent role?" (Based on their answer)
+3. "Tell me about the most challenging project you worked on." (Specific)
+4. "What was your specific contribution to that project?" (Follow-up)
+5. "How did you handle testing and deployment?" (Related follow-up)
+6. "Let's talk about your database experience. What systems have you used?" (Pivot)
+
+**YOUR TASK:**
+
+You will receive the candidate's last answer. Generate the next question that:
+1. Flows naturally from their previous response
+2. Explores a relevant skill or experience from their resume
+3. Helps assess their technical capabilities for screening
+4. Is conversational and professional
+5. Is clear, specific, and answerable in 1-2 minutes
+
+**IMPORTANT REMINDERS:**
+- One question at a time
+- Natural, conversational tone
+- 10-20 words per question
+- Build on their answers
+- Cover breadth, not depth
+- Keep the interview moving forward
+
+Remember: You're conducting a **screening interview**, not an interrogation. Be professional, conversational, and focused on understanding their technical background broadly.
 """
         # --- END OF MODIFICATION ---
         
@@ -280,9 +362,18 @@ Your primary goal is to conduct a **broad, high-level screening** of the candida
                     prompt_tokens = getattr(metadata, 'prompt_token_count', 0)
                     response_tokens = getattr(metadata, 'candidates_token_count', 0)
                     total_tokens = getattr(metadata, 'total_token_count', 0)
+                    
+                    # Update in-memory counters
                     self._session_token_counts[session_id]['prompt'] += prompt_tokens
                     self._session_token_counts[session_id]['response'] += response_tokens
                     self._session_token_counts[session_id]['total'] += total_tokens
+                    
+                    # --- MODIFIED: Call new DB function ---
+                    self.db.update_gemini_token_usage(
+                        session_id, "interview", 
+                        prompt_tokens, response_tokens, total_tokens
+                    )
+                    
                     logger.debug(f"[Turn Tokens] P:{prompt_tokens}, R:{response_tokens}, T:{total_tokens}")
                 else: 
                     # We look at the stream's prompt_feedback
@@ -300,9 +391,14 @@ Your primary goal is to conduct a **broad, high-level screening** of the candida
             logger.error(f"Gemini streaming generate fail: {e}", exc_info=True)
             yield "Apologies, an error occurred. What is a key skill you possess?"
 
+    # --- START OF MODIFICATION ---
+    # This function is now re-written to buffer the first sentence,
+    # preventing a 5s timeout if Gemini is slow to start.
     def stream_interview_turn(self, session_id: str, turn_count: int, candidate_id: str) -> iter:
         """
         Chains Gemini sentence streaming to TTS streaming.
+        This version buffers the first sentence from Gemini to prevent a
+        5-second TTS timeout.
         Yields raw audio_bytes (MULAW encoded).
         """
         if not self.tts_client:
@@ -311,8 +407,38 @@ Your primary goal is to conduct a **broad, high-level screening** of the candida
 
         full_question_text = []
 
-        def request_generator(sentence_gen):
+        # 1. Get the sentence generator from Gemini
+        try:
+            sentence_generator = self._stream_gemini_sentences(session_id)
+        except Exception as gemini_e:
+            logger.error(f"Error creating Gemini generator: {gemini_e}", exc_info=True)
+            fallback_gen = self.stream_plain_text("Apologies, an error occurred.", session_id, turn_count, candidate_id)
+            for chunk in fallback_gen:
+                yield chunk
+            return
+            
+        # 2. Block and wait for the *first* sentence
+        try:
+            first_sentence = next(sentence_generator)
+            if not first_sentence:
+                logger.warning("Gemini returned an empty first sentence.")
+                return
+            full_question_text.append(first_sentence)
+            logger.debug(f"Got first sentence from Gemini: '{first_sentence}'")
+        except StopIteration:
+            logger.warning("Gemini stream was empty, returned no text.")
+            return
+        except Exception as first_sent_e:
+            logger.error(f"Error getting first sentence from Gemini: {first_sent_e}", exc_info=True)
+            fallback_gen = self.stream_plain_text("Apologies, an error occurred.", session_id, turn_count, candidate_id)
+            for chunk in fallback_gen:
+                yield chunk
+            return
+
+        # 3. Define the TTS request generator
+        def request_generator():
             try:
+                # First, yield the streaming configuration
                 yield texttospeech.StreamingSynthesizeRequest(
                     streaming_config={
                         'voice': {
@@ -326,9 +452,16 @@ Your primary goal is to conduct a **broad, high-level screening** of the candida
                     }
                 )
                 
-                for sentence in sentence_gen:
+                # Now, yield the first sentence (which we already have)
+                logger.debug(f"Streaming FIRST sentence to TTS: '{first_sentence}'")
+                yield texttospeech.StreamingSynthesizeRequest(
+                    input={'text': first_sentence}
+                )
+
+                # 4. Yield the rest of the sentences from the Gemini generator
+                for sentence in sentence_generator:
                     full_question_text.append(sentence)
-                    logger.debug(f"Streaming sentence to TTS: '{sentence}'")
+                    logger.debug(f"Streaming subsequent sentence to TTS: '{sentence}'")
                     yield texttospeech.StreamingSynthesizeRequest(
                         input={'text': sentence}
                     )
@@ -336,18 +469,25 @@ Your primary goal is to conduct a **broad, high-level screening** of the candida
             except Exception as e:
                 logger.error(f"Error in TTS request_generator: {e}", exc_info=True)
 
+        # 5. Start the TTS stream (NOW it's safe)
         try:
-            sentence_generator = self._stream_gemini_sentences(session_id)
             tts_stream = self.tts_client.streaming_synthesize(
-                requests=request_generator(sentence_generator)
+                requests=request_generator()
             )
 
             for tts_response in tts_stream:
                 if tts_response.audio_content:
                     yield tts_response.audio_content
 
+            # Log the full text once streaming is complete
             combined_text = " ".join(full_question_text)
             if combined_text:
+                # Track TTS character count
+                char_count = len(combined_text)
+                self._session_tts_char_counts[session_id] += char_count
+                # --- NEW: Save to database ---
+                self.db.update_tts_character_usage(session_id, char_count)
+                
                 audio_dir = Path("data") / candidate_id / session_id / "audio"
                 audio_dir.mkdir(parents=True, exist_ok=True)
                 audio_path = audio_dir / f"bot_{session_id}_{turn_count}_streamed.txt"
@@ -359,10 +499,11 @@ Your primary goal is to conduct a **broad, high-level screening** of the candida
                 logger.info(f"💾 BG save ok (streamed text): {audio_path}")
             
         except Exception as e:
-            logger.error(f"Error in stream_interview_turn: {e}", exc_info=True)
+            logger.error(f"Error in stream_interview_turn (TTS phase): {e}", exc_info=True)
             fallback_gen = self.stream_plain_text("Apologies, an error occurred.", session_id, turn_count, candidate_id)
             for chunk in fallback_gen:
                 yield chunk
+    # --- END OF MODIFICATION ---
 
     def stream_plain_text(self, plain_text: str, session_id: str, turn_count: Any, candidate_id: str, is_follow_up: bool = False) -> iter:
         """
@@ -376,7 +517,13 @@ Your primary goal is to conduct a **broad, high-level screening** of the candida
 
         try:
             char_count = len(plain_text)
+            
+            # Update in-memory counter
             self._session_tts_char_counts[session_id] += char_count
+            
+            # --- NEW: Save to database ---
+            self.db.update_tts_character_usage(session_id, char_count)
+            
             logger.info(f"Generating TTS audio (streaming TEXT, {char_count} chars): '{plain_text[:50]}...'")
 
             def request_generator():
@@ -481,11 +628,28 @@ Your primary goal is to conduct a **broad, high-level screening** of the candida
                 f.write(f"Date: {created_at.strftime('%Y-%m-%d %H:%M:%S')}\n" if created_at else "Date: N/A\n")
                 f.write(f"Questionnaire Provided: {'Yes' if session_data.get('questionnaire') else 'No'} ({len(session_data.get('questionnaire', []))} questions)\n")
                 
-                # --- NEW: Add Tab Switch Summary ---
-                tab_events = session_data.get("tab_switch_events", [])
-                hidden_events = [e for e in tab_events if e.get('visibilityState') == 'hidden']
-                f.write(f"Tab Switches (Hidden): {len(hidden_events)}\n")
-                # --- END NEW ---
+                usage = session_data.get("usage_tracking", {})
+                # --- Add Token Usage Summary ---
+                gemini_interview = usage.get("gemini_interview", {})
+                f.write(f"Gemini (Interview) - Prompt: {gemini_interview.get('prompt_tokens', 0)}, ")
+                f.write(f"Response: {gemini_interview.get('response_tokens', 0)}, ")
+                f.write(f"Total: {gemini_interview.get('total_tokens', 0)}\n")
+
+                # Gemini Analysis (for future use)
+                gemini_analysis = usage.get("gemini_analysis", {})
+                if gemini_analysis.get('total_tokens', 0) > 0:
+                    f.write(f"Gemini (Analysis) - Prompt: {gemini_analysis.get('prompt_tokens', 0)}, ")
+                    f.write(f"Response: {gemini_analysis.get('response_tokens', 0)}, ")
+                    f.write(f"Total: {gemini_analysis.get('total_tokens', 0)}\n")
+                
+                # TTS
+                tts_usage = usage.get("tts", {})
+                f.write(f"TTS Characters: {tts_usage.get('total_characters', 0)}\n")
+                
+                # STT
+                stt_usage = usage.get("stt", {})
+                f.write(f"STT Duration (seconds): {stt_usage.get('total_seconds', 0.0):.2f}\n")
+                # --- END MODIFICATION ---
 
                 f.write("--------------------------------\n\n")
                 
@@ -522,6 +686,16 @@ Your primary goal is to conduct a **broad, high-level screening** of the candida
             totals = self._session_token_counts[session_id]
             logger.info(f"--- Total Interview Chat Tokens (Session: {session_id}) ---")
             logger.info(f"Prompt: {totals['prompt']}, Response: {totals['response']}, Total: {totals['total']}")
+            
+            # --- NEW: Verify database has the same totals ---
+            session_data = self.db.get_session(session_id)
+            if session_data and 'usage_tracking' in session_data:
+                db_usage = session_data['usage_tracking']
+                db_interview = db_usage.get("gemini_interview", {})
+                logger.info(f"Database Gemini (Interview) Totals: P:{db_interview.get('prompt_tokens', 0)}, "
+                           f"R:{db_interview.get('response_tokens', 0)}, T:{db_interview.get('total_tokens', 0)}")
+            # --- END Verification ---
+            
             del self._session_token_counts[session_id]
         else: 
             logger.warning(f"No token count data for session {session_id} on end.")
@@ -530,6 +704,14 @@ Your primary goal is to conduct a **broad, high-level screening** of the candida
             total_chars = self._session_tts_char_counts[session_id]
             logger.info(f"--- Total TTS Characters Synthesized (Session: {session_id}) ---")
             logger.info(f"Total Characters: {total_chars}")
+            
+            # --- NEW: Verify database has the same total ---
+            session_data = self.db.get_session(session_id)
+            if session_data and 'usage_tracking' in session_data:
+                db_chars = session_data['usage_tracking'].get("tts", {}).get('total_characters', 0)
+                logger.info(f"Database TTS Characters: {db_chars}")
+            # --- END Verification ---
+            
             logger.info("-------------------------------------------------")
             del self._session_tts_char_counts[session_id]
         else: 

@@ -1,5 +1,6 @@
 # app/services/transcript_analyzer.py
 # app/services/transcript_analyzer.py
+from bson import ObjectId
 import google.generativeai as genai
 import json
 import re
@@ -16,31 +17,30 @@ logger = logging.getLogger(__name__)
 # --- Get settings directly from env ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # Use a specific model for analysis, separate from the chat model
-TRANSCRIPT_ANALYSIS_MODEL_NAME = os.getenv("TRANSCRIPT_ANALYSIS_MODEL", "gemini-2.5-pro") # Default to pro for analysis
+TRANSCRIPT_ANALYSIS_MODEL_NAME = os.getenv("TRANSCRIPT_ANALYSIS_MODEL", "gemini-2.5-flash") # Default to pro for analysis
 # --- END Config ---
 
 
 class TranscriptAnalyzer:
     """Service to analyze interviews using Gemini AI based on transcripts"""
 
-    def __init__(self):
-        """Initialize Gemini API"""
+    def __init__(self, db_handler=None):
+        """Initialize Gemini API and optionally accept a database handler"""
         if not GEMINI_API_KEY:
             raise ValueError("GEMINI_API_KEY not configured for TranscriptAnalyzer")
 
-        # Configure API key if not already done globally (safe to call again)
         try:
              genai.configure(api_key=GEMINI_API_KEY)
         except Exception as e:
              logger.warning(f"Potentially re-configuring Gemini API key: {e}")
 
-        # Use the specific model defined for transcript analysis
         try:
             self.model = genai.GenerativeModel(TRANSCRIPT_ANALYSIS_MODEL_NAME)
             logger.info(f"TranscriptAnalyzer initialized with model: {TRANSCRIPT_ANALYSIS_MODEL_NAME}")
         except Exception as e:
              logger.error(f"Failed to initialize Gemini model '{TRANSCRIPT_ANALYSIS_MODEL_NAME}': {e}")
              raise ValueError(f"Could not initialize Gemini model for transcript analysis: {e}")
+        self.db = db_handler
 
     # Marked as regular function, use asyncio.to_thread if called from async context
     def analyze(self, resume_content: str, transcript_data: Dict[str, Any]) -> OverallAnalysis:
@@ -73,27 +73,47 @@ class TranscriptAnalyzer:
 
             # --- Log Token Usage ---
             try:
-                # Attempt to get metadata directly
                 metadata = getattr(response, 'usage_metadata', None)
-                # Fallback check via prompt_feedback if direct access fails
                 if not metadata:
                     feedback = getattr(response, 'prompt_feedback', None)
                     metadata = getattr(feedback, 'usage_metadata', None) if feedback else None
 
                 if metadata:
                     prompt_tokens = getattr(metadata, 'prompt_token_count', 'N/A')
-                    # Use candidates_token_count for response tokens
                     response_tokens = getattr(metadata, 'candidates_token_count', 'N/A')
                     total_tokens = getattr(metadata, 'total_token_count', 'N/A')
-                    # Make log message specific
-                    logger.info(f"Gemini Transcript Analysis Tokens - Prompt: {prompt_tokens}, Response: {response_tokens}, Total: {total_tokens}")
+                    
+                    logger.info(f"Gemini Transcript Analysis Tokens - Prompt: {prompt_tokens}, "
+                            f"Response: {response_tokens}, Total: {total_tokens}")
+                    
+                    # NEW: Save analysis token usage to database if we have a db handler
+                    session_id = transcript_data.get('metadata', {}).get('session_id')
+                    if self.db and session_id and isinstance(prompt_tokens, int):
+                        try:
+                            # Store analysis tokens separately or add to existing totals
+                            # Option 1: Add a new field for analysis tokens
+                            self.db.sessions.update_one(
+                                {"_id": ObjectId(session_id)},
+                                {
+                                    "$set": {
+                                        "analysis_token_usage": {
+                                            "prompt_tokens": prompt_tokens,
+                                            "response_tokens": response_tokens,
+                                            "total_tokens": total_tokens
+                                        }
+                                    }
+                                }
+                            )
+                            logger.info(f"Saved analysis token usage to database for session {session_id}")
+                        except Exception as db_e:
+                            logger.error(f"Failed to save analysis tokens to database: {db_e}")
                 else:
                     logger.warning("Usage metadata not found in Gemini response for transcript analysis.")
 
             except AttributeError as e:
                 logger.warning(f"Could not access token counts from transcript analysis metadata: {e}")
             except Exception as e:
-                 logger.error(f"Unexpected error logging transcript analysis tokens: {e}")
+                logger.error(f"Unexpected error logging transcript analysis tokens: {e}")
             # --- End Log Token Usage ---
 
 
